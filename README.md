@@ -122,3 +122,5 @@ autonumber
 ```
 
 [tests-badge]: https://github.com/monad-crypto/monad-bft/actions/workflows/randomized.yml/badge.svg?branch=master
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/a26nine/monad-bft)
