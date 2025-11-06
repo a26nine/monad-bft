@@ -98,6 +98,7 @@ struct TestConfig {
     pub last_participation_prune_threshold: Round,
     pub min_num_peers: usize,
     pub max_num_peers: usize,
+    pub max_group_size: usize,
     pub outbound_pipeline: Vec<GenericTransformer<PubKeyType, PeerDiscoveryMessage<SignatureType>>>,
 }
 
@@ -118,6 +119,7 @@ impl Default for TestConfig {
             last_participation_prune_threshold: Round(5000),
             min_num_peers: 5,
             max_num_peers: 50,
+            max_group_size: 50,
             outbound_pipeline: vec![],
         }
     }
@@ -130,10 +132,7 @@ fn generate_name_record(keypair: &KeyPairType) -> MonadNameRecord<SignatureType>
     let ipaddr_v4 = Ipv4Addr::from_bits(u32::from_be_bytes(hash.0[28..32].try_into().unwrap()));
     assert_ne!(ipaddr_v4, Ipv4Addr::UNSPECIFIED);
 
-    let name_record = NameRecord {
-        address: SocketAddrV4::new(ipaddr_v4, 8000),
-        seq: 0,
-    };
+    let name_record = NameRecord::new(ipaddr_v4, 8000, 0);
     let mut encoded = Vec::new();
     name_record.encode(&mut encoded);
     let signature = SignatureType::sign::<signing_domain::NameRecord>(&encoded, keypair);
@@ -198,7 +197,7 @@ fn setup_keys_and_swarm_builder(
                     .collect::<BTreeSet<_>>();
                 NodeBuilder {
                     id: NodeId::new(key.pubkey()),
-                    addr: generate_name_record(key).address(),
+                    addr: generate_name_record(key).udp_address(),
                     algo_builder: PeerDiscoveryBuilder {
                         self_id,
                         self_record: generate_name_record(key),
@@ -206,6 +205,7 @@ fn setup_keys_and_swarm_builder(
                         current_epoch: config.current_epoch,
                         epoch_validators: epoch_validators.clone(),
                         pinned_full_nodes,
+                        prioritized_full_nodes: BTreeSet::new(),
                         bootstrap_peers,
                         refresh_period: config.refresh_period,
                         request_timeout: config.request_timeout,
@@ -214,6 +214,7 @@ fn setup_keys_and_swarm_builder(
                             .last_participation_prune_threshold,
                         min_num_peers: config.min_num_peers,
                         max_num_peers: config.max_num_peers,
+                        max_group_size: config.max_group_size,
                         enable_publisher: secondary_raptorcast_enabled,
                         enable_client: secondary_raptorcast_enabled,
                         rng: ChaCha8Rng::seed_from_u64(123456), // fixed seed for reproducibility
@@ -360,10 +361,11 @@ fn test_update_name_record() {
         .expect("Node0 state should exist");
 
     // create new name record for Node0 with new IP and incremented seq number
-    let new_name_record = NameRecord {
-        address: SocketAddrV4::from_str("2.2.2.2:8000").unwrap(),
-        seq: 1,
-    };
+    let new_name_record = NameRecord::new(
+        *SocketAddrV4::from_str("2.2.2.2:8000").unwrap().ip(),
+        8000,
+        1,
+    );
     let mut encoded = Vec::new();
     new_name_record.encode(&mut encoded);
     let signature = SignatureType::sign::<signing_domain::NameRecord>(&encoded, node_0_key);
@@ -374,14 +376,15 @@ fn test_update_name_record() {
 
     let new_node_0_builder = NodeBuilder {
         id: node_0,
-        addr: new_name_record.address(),
+        addr: new_name_record.udp_address(),
         algo_builder: PeerDiscoveryBuilder {
             self_id: node_0,
-            self_record: new_name_record,
+            self_record: new_name_record.clone(),
             current_round: config.current_round,
             current_epoch: config.current_epoch,
             epoch_validators: BTreeMap::new(),
             pinned_full_nodes: BTreeSet::new(),
+            prioritized_full_nodes: BTreeSet::new(),
             bootstrap_peers: BTreeMap::from([(node_1, generate_name_record(node_1_key))]),
             refresh_period: config.refresh_period,
             request_timeout: config.request_timeout,
@@ -389,6 +392,7 @@ fn test_update_name_record() {
             last_participation_prune_threshold: config.last_participation_prune_threshold,
             min_num_peers: config.min_num_peers,
             max_num_peers: config.max_num_peers,
+            max_group_size: config.max_group_size,
             enable_publisher: false,
             enable_client: false,
             rng: ChaCha8Rng::seed_from_u64(123456),

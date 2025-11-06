@@ -88,10 +88,10 @@ pub struct EthCallStatsTracker {
 }
 
 impl EthCallStatsTracker {
-    pub async fn record_request_start(&self, request_id: &RequestId) {
+    pub async fn record_request_start(&self, request_id: RequestId) {
         let mut requests = self.active_requests.lock().await;
         requests.insert(
-            request_id.clone(),
+            request_id,
             EthCallRequestStats {
                 entry_time: Instant::now(),
             },
@@ -618,7 +618,7 @@ impl CallParams {
 #[tracing::instrument(level = "debug")]
 async fn prepare_eth_call<T: Triedb + TriedbPath>(
     triedb_env: &T,
-    eth_call_executor: Arc<Mutex<EthCallExecutor>>,
+    eth_call_executor: Arc<EthCallExecutor>,
     chain_id: u64,
     eth_call_provider_gas_limit: u64,
     mut params: CallParams,
@@ -732,10 +732,13 @@ async fn prepare_eth_call<T: Triedb + TriedbPath>(
 
 /// Executes a new message call immediately without creating a transaction on the block chain.
 #[tracing::instrument(level = "debug")]
-#[rpc(method = "eth_call", ignore = "chain_id", ignore = "eth_call_executor")]
+#[rpc(
+    method = "eth_call",
+    ignore = "eth_call_executor,chain_id,eth_call_provider_gas_limit"
+)]
 pub async fn monad_eth_call<T: Triedb + TriedbPath>(
     triedb_env: &T,
-    eth_call_executor: Arc<Mutex<EthCallExecutor>>,
+    eth_call_executor: Arc<EthCallExecutor>,
     chain_id: u64,
     eth_call_provider_gas_limit: u64,
     params: MonadEthCallParams,
@@ -771,7 +774,7 @@ pub async fn monad_eth_call<T: Triedb + TriedbPath>(
 #[allow(non_snake_case)]
 pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
     triedb_env: &T,
-    eth_call_executor: Arc<Mutex<EthCallExecutor>>,
+    eth_call_executor: Arc<EthCallExecutor>,
     chain_id: u64,
     eth_call_gas_limit: u64,
     params: MonadDebugTraceCallParams,
@@ -840,7 +843,10 @@ pub struct EthCallCapacityStats {
 /// Returns statistics about eth_call capacity including inactive executors and queued requests
 #[allow(non_snake_case)]
 #[tracing::instrument(level = "debug")]
-#[monad_rpc_docs::rpc(method = "admin_ethCallStatistics")]
+#[monad_rpc_docs::rpc(
+    method = "admin_ethCallStatistics",
+    ignore = "eth_call_executor_fibers,total_permits,available_permits"
+)]
 pub async fn monad_admin_ethCallStatistics(
     eth_call_executor_fibers: usize,
     total_permits: usize,

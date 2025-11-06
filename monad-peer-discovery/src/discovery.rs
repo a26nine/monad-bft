@@ -87,7 +87,7 @@ pub enum PeerDiscoveryRole {
     FullNodeClient,     // full node set as Client in secondary raptorcast
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionInfo<ST: CertificateSignatureRecoverable> {
     pub last_ping: Ping<ST>,
     pub unresponsive_pings: u32,
@@ -129,7 +129,9 @@ pub struct PeerDiscovery<ST: CertificateSignatureRecoverable> {
     pub epoch_validators: BTreeMap<Epoch, BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
     // initial bootstrap peers set in config file
     pub initial_bootstrap_peers: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
-    // pinned full nodes are dedicated and prioritized full nodes passed in from config that will not be pruned
+    // prioritized full nodes for secondary raptorcast, set in config file
+    pub prioritized_full_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
+    // pinned full nodes contains dedicated and prioritized full nodes, and initial bootstrap peers that will not be pruned
     pub pinned_full_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
     // mapping of node IDs to their corresponding name records
     pub routing_info: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>>,
@@ -156,6 +158,8 @@ pub struct PeerDiscovery<ST: CertificateSignatureRecoverable> {
     pub min_num_peers: usize,
     // maximum number of peers before pruning
     pub max_num_peers: usize,
+    // maximum number of peers in a raptorcast group
+    pub max_group_size: usize,
     // secondary raptorcast setting: enable publisher mode when self is a validator
     pub enable_publisher: bool,
     // secondary raptorcast setting: enable client mode when self is a full node
@@ -170,6 +174,7 @@ pub struct PeerDiscoveryBuilder<ST: CertificateSignatureRecoverable> {
     pub current_epoch: Epoch,
     pub epoch_validators: BTreeMap<Epoch, BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
     pub pinned_full_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
+    pub prioritized_full_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
     pub bootstrap_peers: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>>,
     pub refresh_period: Duration,
     pub request_timeout: Duration,
@@ -177,6 +182,7 @@ pub struct PeerDiscoveryBuilder<ST: CertificateSignatureRecoverable> {
     pub last_participation_prune_threshold: Round,
     pub min_num_peers: usize,
     pub max_num_peers: usize,
+    pub max_group_size: usize,
     pub enable_publisher: bool,
     pub enable_client: bool,
     pub rng: ChaCha8Rng,
@@ -235,6 +241,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDisco
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>(),
+            prioritized_full_nodes: self.prioritized_full_nodes,
             pinned_full_nodes: self.pinned_full_nodes,
             routing_info: Default::default(),
             participation_info: Default::default(),
@@ -247,6 +254,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDisco
             last_participation_prune_threshold: self.last_participation_prune_threshold,
             min_num_peers: self.min_num_peers,
             max_num_peers: self.max_num_peers,
+            max_group_size: self.max_group_size,
             enable_publisher: self.enable_publisher,
             enable_client: self.enable_client,
             rng: self.rng,
@@ -370,9 +378,10 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
         }
 
         // check if the peer ip address is valid
-        if let Err(err) =
-            validate_socket_ipv4_address(&name_record.address(), &self.self_record.address())
-        {
+        if let Err(err) = validate_socket_ipv4_address(
+            &name_record.udp_address(),
+            &self.self_record.udp_address(),
+        ) {
             warn!(
                 ?peer_id,
                 ?name_record,
@@ -405,17 +414,17 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
         // insert into pending queue and send ping
         let ping_msg = Ping {
             id: self.rng.next_u32(),
-            local_name_record: self.self_record,
+            local_name_record: self.self_record.clone(),
         };
         self.pending_queue.insert(peer_id, ConnectionInfo {
-            last_ping: ping_msg,
+            last_ping: ping_msg.clone(),
             unresponsive_pings: 0,
-            name_record,
+            name_record: name_record.clone(),
         });
         self.metrics[GAUGE_PEER_DISC_NUM_PENDING_PEERS] = self.pending_queue.len() as u64;
 
         // send ping to the peer, which will also insert the peer into pending queue
-        Ok(self.send_ping(peer_id, name_record.address(), ping_msg))
+        Ok(self.send_ping(peer_id, name_record.udp_address(), ping_msg))
     }
 
     fn remove_peer_from_pending(
@@ -522,7 +531,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
                     target: *validator,
                     message: PeerDiscoveryMessage::Ping(Ping {
                         id: self.rng.next_u32(),
-                        local_name_record: self.self_record,
+                        local_name_record: self.self_record.clone(),
                     }),
                 });
                 cmds.extend(self.send_full_node_raptorcast_request(*validator));
@@ -643,8 +652,7 @@ where
         // we still respond with pong even if peer list is full
         let mut peer_list_full = false;
         if self.routing_info.len() + self.pending_queue.len() >= self.max_num_peers
-            && !self.check_validator_membership(&from)
-            && !self.pinned_full_nodes.contains(&from)
+            && !self.is_pinned_node(&from)
             && !self.routing_info.contains_key(&from)
         {
             debug!(
@@ -656,7 +664,7 @@ where
         }
 
         if !peer_list_full {
-            let peer_name_record = ping_msg.local_name_record;
+            let peer_name_record = ping_msg.local_name_record.clone();
             if self
                 .routing_info
                 .get(&from)
@@ -699,11 +707,11 @@ where
         // respond to ping
         let pong_msg = Pong {
             ping_id: ping_msg.id,
-            local_record_seq: self.self_record.name_record.seq,
+            local_record_seq: self.self_record.seq(),
         };
         cmds.push(PeerDiscoveryCommand::PingPongCommand {
             target: from,
-            socket_address: ping_msg.local_name_record.address(),
+            socket_address: ping_msg.local_name_record.udp_address(),
             message: PeerDiscoveryMessage::Pong(pong_msg),
         });
         self.metrics[GAUGE_PEER_DISC_SEND_PONG] += 1;
@@ -725,7 +733,7 @@ where
             if info.last_ping.id == pong_msg.ping_id {
                 // if ping id matches, promote peer to routing_info
                 debug!(?from, ?info.name_record, "promoting peer to routing info");
-                cmds.extend(self.promote_peer_to_routing_info(from, info.name_record));
+                cmds.extend(self.promote_peer_to_routing_info(from, info.name_record.clone()));
             } else {
                 debug!(?from, "dropping pong, ping id does not match");
                 self.metrics[GAUGE_PEER_DISC_DROP_PONG] += 1;
@@ -772,12 +780,12 @@ where
                 cmds.extend(self.remove_peer_from_pending(to));
             } else {
                 // retry ping
-                let socket_address = info.name_record.address();
+                let socket_address = info.name_record.udp_address();
                 let ping = Ping {
                     id: self.rng.next_u32(),
-                    local_name_record: self.self_record,
+                    local_name_record: self.self_record.clone(),
                 };
-                info.last_ping = ping;
+                info.last_ping = ping.clone();
                 cmds.extend(self.send_ping(to, socket_address, ping));
             }
         }
@@ -837,10 +845,10 @@ where
         let target = request.target;
 
         let mut name_records = if target == self.self_id {
-            vec![self.self_record]
+            vec![self.self_record.clone()]
         } else {
             match self.routing_info.get(&target) {
-                Some(name_record) => vec![*name_record],
+                Some(name_record) => vec![name_record.clone()],
                 None => vec![],
             }
         };
@@ -862,7 +870,7 @@ where
                         MAX_PEER_IN_RESPONSE.saturating_sub(name_records.len()),
                     )
                     .into_iter()
-                    .map(|(_, name_record)| *name_record),
+                    .map(|(_, name_record)| (*name_record).clone()),
             );
         } else {
             self.metrics[GAUGE_PEER_DISC_RECV_TARGETED_LOOKUP_REQUEST] += 1;
@@ -1089,6 +1097,28 @@ where
             return cmds;
         }
 
+        // drop request if incoming request is a public full node and max_group_size is already reached
+        if !self.prioritized_full_nodes.contains(&from) {
+            let connected_public_full_nodes = self
+                .participation_info
+                .iter()
+                .filter(|(node_id, info)| {
+                    info.status == SecondaryRaptorcastConnectionStatus::Connected
+                        && !self.prioritized_full_nodes.contains(node_id)
+                })
+                .count();
+
+            if connected_public_full_nodes + self.prioritized_full_nodes.len()
+                >= self.max_group_size
+            {
+                debug!(
+                    ?from,
+                    "connected full nodes already exceeds max group size, dropping request"
+                );
+                return cmds;
+            }
+        }
+
         if let Some(info) = self.participation_info.get_mut(&from) {
             info.status = SecondaryRaptorcastConnectionStatus::Connected;
         } else {
@@ -1154,7 +1184,6 @@ where
             .filter_map(|(node_id, info)| {
                 if self.current_round.max(info.last_active) - info.last_active
                     >= self.last_participation_prune_threshold
-                    && !self.is_pinned_node(node_id)
                 {
                     Some(*node_id)
                 } else {
@@ -1164,9 +1193,16 @@ where
             .collect();
 
         for node_id in non_participating_nodes {
-            debug!(?node_id, "removing non-participating peer");
-            self.participation_info.remove(&node_id);
-            self.routing_info.remove(&node_id);
+            if self.is_pinned_node(&node_id) {
+                debug!(?node_id, "clearing participation info for pinned node");
+                if let Some(info) = self.participation_info.get_mut(&node_id) {
+                    info.status = SecondaryRaptorcastConnectionStatus::None;
+                }
+            } else {
+                debug!(?node_id, "removing non-participating peer");
+                self.participation_info.remove(&node_id);
+                self.routing_info.remove(&node_id);
+            }
         }
 
         // if number of peers above max number of peers, randomly choose a few full nodes and prune them from routing_info
@@ -1344,7 +1380,7 @@ where
                             target: validator,
                             message: PeerDiscoveryMessage::Ping(Ping {
                                 id: self.rng.next_u32(),
-                                local_name_record: self.self_record,
+                                local_name_record: self.self_record.clone(),
                             }),
                         });
                     }
@@ -1382,10 +1418,11 @@ where
 
             // verify signature of name record
             let name_record = MonadNameRecord {
-                name_record: NameRecord {
-                    address: peer.addr,
-                    seq: peer.record_seq_num,
-                },
+                name_record: NameRecord::new(
+                    *peer.addr.ip(),
+                    peer.addr.port(),
+                    peer.record_seq_num,
+                ),
                 signature: peer.signature,
             };
             let verified = name_record
@@ -1406,11 +1443,21 @@ where
 
     fn update_pinned_nodes(
         &mut self,
-        pinned_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
+        dedicated_full_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
+        prioritized_full_nodes: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
     ) -> Vec<PeerDiscoveryCommand<ST>> {
-        debug!(?pinned_nodes, "updating pinned nodes");
+        debug!(
+            ?dedicated_full_nodes,
+            ?prioritized_full_nodes,
+            "updating pinned nodes"
+        );
 
-        self.pinned_full_nodes = pinned_nodes;
+        self.pinned_full_nodes = dedicated_full_nodes
+            .iter()
+            .chain(prioritized_full_nodes.iter())
+            .cloned()
+            .collect();
+        self.prioritized_full_nodes = prioritized_full_nodes;
 
         Vec::new()
     }
@@ -1455,33 +1502,31 @@ where
     ) -> Option<SocketAddrV4> {
         self.pending_queue
             .get(id)
-            .map(|info| info.name_record.address())
+            .map(|info| info.name_record.udp_address())
     }
 
     fn get_addr_by_id(&self, id: &NodeId<CertificateSignaturePubKey<ST>>) -> Option<SocketAddrV4> {
         self.routing_info
             .get(id)
-            .map(|name_record| name_record.address())
+            .map(|name_record| name_record.udp_address())
     }
 
     fn get_known_addrs(&self) -> HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4> {
         self.routing_info
             .iter()
-            .map(|(id, name_record)| (*id, name_record.address()))
+            .map(|(id, name_record)| (*id, name_record.udp_address()))
             .collect()
     }
 
-    fn get_secondary_fullnode_addrs(
-        &self,
-    ) -> HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4> {
+    fn get_secondary_fullnodes(&self) -> Vec<NodeId<CertificateSignaturePubKey<ST>>> {
         self.routing_info
-            .iter()
-            .filter(|(id, _)| {
+            .keys()
+            .filter(|id| {
                 self.participation_info
                     .get(id)
                     .is_some_and(|p| p.status == SecondaryRaptorcastConnectionStatus::Connected)
             })
-            .map(|(id, name_record)| (*id, name_record.address()))
+            .copied()
             .collect()
     }
 
@@ -1490,7 +1535,7 @@ where
     ) -> HashMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>> {
         self.routing_info
             .iter()
-            .map(|(id, name_record)| (*id, *name_record))
+            .map(|(id, name_record)| (*id, name_record.clone()))
             .collect()
     }
 }
@@ -1519,10 +1564,7 @@ mod tests {
     const DUMMY_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 8000);
 
     fn generate_name_record(keypair: &KeyPairType, seq_num: u64) -> MonadNameRecord<SignatureType> {
-        let name_record = NameRecord {
-            address: DUMMY_ADDR,
-            seq: seq_num,
-        };
+        let name_record = NameRecord::new(*DUMMY_ADDR.ip(), DUMMY_ADDR.port(), seq_num);
         let mut encoded = Vec::new();
         name_record.encode(&mut encoded);
         let signature = SignatureType::sign::<signing_domain::NameRecord>(&encoded, keypair);
@@ -1567,6 +1609,7 @@ mod tests {
             epoch_validators: BTreeMap::new(),
             initial_bootstrap_peers: routing_info.keys().cloned().collect(),
             pinned_full_nodes: BTreeSet::new(),
+            prioritized_full_nodes: BTreeSet::new(),
             routing_info,
             participation_info,
             pending_queue: BTreeMap::new(),
@@ -1578,6 +1621,7 @@ mod tests {
             last_participation_prune_threshold: Round(5000),
             min_num_peers: 5,
             max_num_peers: 50,
+            max_group_size: 50,
             enable_publisher: false,
             enable_client: false,
             rng: ChaCha8Rng::seed_from_u64(123456),
@@ -1655,7 +1699,7 @@ mod tests {
         // send ping to peer1
         let ping = Ping {
             id: 12345,
-            local_name_record: state.self_record,
+            local_name_record: state.self_record.clone(),
         };
         let cmds = state.send_ping(peer1_pubkey, DUMMY_ADDR, ping);
 
@@ -1688,7 +1732,7 @@ mod tests {
             local_name_record: generate_name_record(peer0, 0),
         };
         state.pending_queue.insert(peer1_pubkey, ConnectionInfo {
-            last_ping,
+            last_ping: last_ping.clone(),
             unresponsive_pings: 3,
             name_record: generate_name_record(peer1, 0),
         });
@@ -1715,7 +1759,7 @@ mod tests {
         let name_record = generate_name_record(peer1, 0);
         let ping = Ping {
             id: 12345,
-            local_name_record: name_record,
+            local_name_record: name_record.clone(),
         };
         let cmds = state.handle_ping(peer1_pubkey, ping);
 
@@ -1730,7 +1774,7 @@ mod tests {
         let pong = extract_pong(cmds);
         assert_eq!(pong.len(), 1);
         assert_eq!(pong[0].ping_id, 12345);
-        assert_eq!(pong[0].local_record_seq, state.self_record.name_record.seq);
+        assert_eq!(pong[0].local_record_seq, state.self_record.seq());
 
         // added to pending queue but not yet to routing_info
         assert!(state.pending_queue.contains_key(&peer1_pubkey));
@@ -1811,7 +1855,7 @@ mod tests {
         let cmds = state.handle_peer_lookup_response(peer1_pubkey, PeerLookupResponse {
             lookup_id: requests[0].lookup_id,
             target: peer2_pubkey,
-            name_records: vec![record],
+            name_records: vec![record.clone()],
         });
 
         // peer2 should be added to pending queue and outstanding requests should be cleared
@@ -1897,7 +1941,9 @@ mod tests {
 
         // should add to pending queue and send ping if record has higher sequence number (seq num incremented to 2)
         let record = generate_name_record(peer1, 2);
-        let cmds = state.insert_peer_to_pending(peer1_pubkey, record).unwrap();
+        let cmds = state
+            .insert_peer_to_pending(peer1_pubkey, record.clone())
+            .unwrap();
         let pings = extract_ping(cmds);
         assert_eq!(pings.len(), 1);
         assert_eq!(pings[0].0, peer1_pubkey);
@@ -1905,9 +1951,9 @@ mod tests {
         assert_eq!(
             state.pending_queue.get(&peer1_pubkey).unwrap(),
             &ConnectionInfo {
-                last_ping: pings[0].1,
+                last_ping: pings[0].1.clone(),
                 unresponsive_pings: 0,
-                name_record: record,
+                name_record: record.clone(),
             }
         );
         assert_eq!(state.routing_info.get(&peer1_pubkey).unwrap().seq(), 0);
@@ -1915,7 +1961,7 @@ mod tests {
         // should not replace existing entry in pending queue if record has lower sequence number (seq num decremented to 1)
         let invalid_record = generate_name_record(peer1, 1);
         let cmds = state
-            .insert_peer_to_pending(peer1_pubkey, invalid_record)
+            .insert_peer_to_pending(peer1_pubkey, invalid_record.clone())
             .unwrap();
         assert!(cmds.is_empty());
 
@@ -1999,7 +2045,7 @@ mod tests {
         let pending_queue = BTreeMap::from([(peer1_pubkey, ConnectionInfo {
             last_ping: Ping {
                 id: ping_id,
-                local_name_record: state.self_record,
+                local_name_record: state.self_record.clone(),
             },
             unresponsive_pings: 5,
             name_record: generate_name_record(peer1, 0),
@@ -2180,11 +2226,11 @@ mod tests {
     const OLD_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(7, 7, 7, 7), 8000);
     const NEW_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 8000);
 
-    #[test_case(None, NameRecord { address: NEW_ADDR, seq: 1 }, true, NameRecord { address: NEW_ADDR, seq: 1 }, true; "first record")]
-    #[test_case(Some(NameRecord { address: OLD_ADDR, seq: 1 }), NameRecord { address: NEW_ADDR, seq: 2 }, true, NameRecord { address: NEW_ADDR, seq: 2 }, true; "newer record")]
-    #[test_case(Some(NameRecord { address: OLD_ADDR, seq: 1 }), NameRecord { address: OLD_ADDR, seq: 1 }, true, NameRecord { address: OLD_ADDR, seq: 1 }, false; "same record")]
-    #[test_case(Some(NameRecord { address: NEW_ADDR, seq: 2 }), NameRecord { address: OLD_ADDR, seq: 1 }, false, NameRecord { address: NEW_ADDR, seq: 2 }, false; "older record")]
-    #[test_case(Some(NameRecord { address: OLD_ADDR, seq: 1 }), NameRecord { address: NEW_ADDR, seq: 1 }, false, NameRecord { address: OLD_ADDR, seq: 1 }, false; "conflicting record")]
+    #[test_case(None, NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 1), true, NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 1), true; "first record")]
+    #[test_case(Some(NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1)), NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 2), true, NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 2), true; "newer record")]
+    #[test_case(Some(NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1)), NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1), true, NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1), false; "same record")]
+    #[test_case(Some(NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 2)), NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1), false, NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 2), false; "older record")]
+    #[test_case(Some(NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1)), NameRecord::new(*NEW_ADDR.ip(), NEW_ADDR.port(), 1), false, NameRecord::new(*OLD_ADDR.ip(), OLD_ADDR.port(), 1), false; "conflicting record")]
     fn test_ping_record(
         known_record: Option<NameRecord>,
         incoming_record: NameRecord,
@@ -2216,7 +2262,12 @@ mod tests {
                 // 1 PingTimeout timer cmd, 1 SendPing cmd, 1 Pong cmd
                 assert_eq!(cmds.len(), 3);
 
-                let node1_record = state.pending_queue.get(&peer1_pubkey).unwrap().name_record;
+                let node1_record = state
+                    .pending_queue
+                    .get(&peer1_pubkey)
+                    .unwrap()
+                    .name_record
+                    .clone();
                 assert_eq!(expected_record, node1_record.name_record);
             } else {
                 // 1 Pong cmd
@@ -2236,18 +2287,22 @@ mod tests {
 
     #[test]
     fn test_publisher_participation_info() {
-        let keys = create_keys::<SignatureType>(2);
+        let keys = create_keys::<SignatureType>(4);
         let peer0 = &keys[0];
         let peer1 = &keys[1];
+        let peer2 = &keys[2];
+        let peer3 = &keys[3];
         let peer1_pubkey = NodeId::new(peer1.pubkey());
+        let peer2_pubkey = NodeId::new(peer2.pubkey());
+        let peer3_pubkey = NodeId::new(peer3.pubkey());
 
-        let mut state = generate_test_state(peer0, vec![peer1]);
+        let mut state = generate_test_state(peer0, vec![peer1, peer2, peer3]);
 
         // do not respond to full node raptorcast request if self is not a validator publisher
         state.self_role = PeerDiscoveryRole::ValidatorNone;
         let cmds = state.handle_full_node_raptorcast_request(peer1_pubkey);
         assert_eq!(cmds.len(), 0);
-        assert_eq!(state.get_secondary_fullnode_addrs(), HashMap::new());
+        assert_eq!(state.get_secondary_fullnodes(), Vec::new());
 
         // after receiving a full node raptorcast request from peer1,
         // it should mark it as connected
@@ -2263,10 +2318,53 @@ mod tests {
             target: _,
             message: PeerDiscoveryMessage::FullNodeRaptorcastResponse
         }));
+        assert_eq!(state.get_secondary_fullnodes(), Vec::from([peer1_pubkey]));
+
+        // do not respond to full node raptorcast request if already exceeding max group size
+        state.max_group_size = 1;
+        let cmds = state.handle_full_node_raptorcast_request(peer2_pubkey);
         assert_eq!(
-            state.get_secondary_fullnode_addrs(),
-            HashMap::from([(peer1_pubkey, generate_name_record(peer1, 0).address())])
+            state.participation_info.get(&peer2_pubkey).unwrap().status,
+            SecondaryRaptorcastConnectionStatus::None
         );
+        assert_eq!(cmds.len(), 0);
+        assert_eq!(state.get_secondary_fullnodes(), Vec::from([peer1_pubkey]));
+
+        // prioritized full nodes are reserved a slot even if unconnected
+        state.prioritized_full_nodes.insert(peer3_pubkey);
+        state.max_group_size = 2;
+        let cmds = state.handle_full_node_raptorcast_request(peer2_pubkey);
+        // peer1 (connected) and peer3 (prioritized) took up the slots
+        // peer2 is still rejected
+        assert_eq!(
+            state.participation_info.get(&peer1_pubkey).unwrap().status,
+            SecondaryRaptorcastConnectionStatus::Connected
+        );
+        assert_eq!(
+            state.participation_info.get(&peer2_pubkey).unwrap().status,
+            SecondaryRaptorcastConnectionStatus::None
+        );
+        assert_eq!(
+            state.participation_info.get(&peer3_pubkey).unwrap().status,
+            SecondaryRaptorcastConnectionStatus::None
+        );
+        assert_eq!(cmds.len(), 0);
+        assert_eq!(state.get_secondary_fullnodes(), Vec::from([peer1_pubkey]));
+
+        // a connected prioritized full node is only counted once towards max_group_size
+        state.handle_full_node_raptorcast_request(peer3_pubkey);
+        assert_eq!(
+            state.participation_info.get(&peer3_pubkey).unwrap().status,
+            SecondaryRaptorcastConnectionStatus::Connected
+        );
+        state.max_group_size = 3;
+        let cmds = state.handle_full_node_raptorcast_request(peer2_pubkey);
+        // now peer2 is accepted as there are only 2 connections
+        assert_eq!(
+            state.participation_info.get(&peer2_pubkey).unwrap().status,
+            SecondaryRaptorcastConnectionStatus::Connected
+        );
+        assert_eq!(cmds.len(), 1);
     }
 
     #[test]
