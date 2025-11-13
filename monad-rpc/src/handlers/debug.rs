@@ -244,7 +244,7 @@ impl Decodable for CallFrame {
     }
 }
 
-#[derive(Deserialize, Debug, Default, schemars::JsonSchema, Clone)]
+#[derive(Deserialize, Debug, Default, schemars::JsonSchema, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct TracerObject {
     #[serde(default)]
@@ -253,7 +253,7 @@ pub struct TracerObject {
     pub config: TracerConfig,
 }
 
-#[derive(Deserialize, Debug, Default, schemars::JsonSchema, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Default, schemars::JsonSchema, Clone, Copy, PartialEq, Eq)]
 pub enum Tracer {
     #[default]
     #[serde(rename = "callTracer")]
@@ -262,7 +262,7 @@ pub enum Tracer {
     PreStateTracer,
 }
 
-#[derive(Clone, Debug, Deserialize, Default, schemars::JsonSchema)]
+#[derive(Clone, Copy, Debug, Deserialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TracerConfig {
     /// onlyTopCall for callTracer, ignored for prestateTracer
@@ -278,11 +278,11 @@ pub struct TracerConfig {
     pub with_log: bool,
 }
 
-#[derive(Deserialize, Debug, schemars::JsonSchema)]
+#[derive(Clone, Copy, Deserialize, Debug, schemars::JsonSchema)]
 pub struct MonadDebugTraceTransactionParams {
-    tx_hash: EthHash,
+    pub tx_hash: EthHash,
     #[serde(default)]
-    tracer: TracerObject,
+    pub tracer: TracerObject,
 }
 
 #[derive(Serialize, Debug, schemars::JsonSchema)]
@@ -360,10 +360,21 @@ impl From<CallFrame> for MonadCallFrame {
             .as_ref()
             .and_then(|_| monad_ethcall::decode_revert_message(&value.output));
 
+        let mut to = value.to.map(Into::into);
+
+        // Historical traces include a Some(NullAddress) for the 'to' field if the contract deployment failed.
+        // Newer traces do not include the 'to' field, so match this behavior.
+        if error.is_some()
+            && matches!(value.typ, CallKind::Create | CallKind::Create2)
+            && value.to.is_some()
+        {
+            to = None;
+        }
+
         Self {
             typ: value.typ,
             from: value.from.into(),
-            to: value.to.map(Into::into),
+            to,
             value: frame_value,
             gas: Quantity(u64::from_le_bytes(value.gas.to_le_bytes())),
             gas_used: Quantity(u64::from_le_bytes(value.gas_used.to_le_bytes())),
@@ -395,9 +406,9 @@ pub enum CallKind {
 
 #[derive(Deserialize, Debug, schemars::JsonSchema)]
 pub struct MonadDebugTraceBlockByHashParams {
-    block_hash: EthHash,
+    pub block_hash: EthHash,
     #[serde(default)]
-    tracer: TracerObject,
+    pub tracer: TracerObject,
 }
 
 #[rpc(method = "debug_traceBlockByHash")]
@@ -464,11 +475,11 @@ pub async fn monad_debug_traceBlockByHash<T: Triedb>(
     Err(JsonRpcError::internal_error("block not found".into()))
 }
 
-#[derive(Deserialize, Debug, schemars::JsonSchema)]
+#[derive(Clone, Copy, Deserialize, Debug, schemars::JsonSchema)]
 pub struct MonadDebugTraceBlockByNumberParams {
-    block_number: BlockTags,
+    pub block_number: BlockTags,
     #[serde(default)]
-    tracer: TracerObject,
+    pub tracer: TracerObject,
 }
 
 #[derive(Serialize, Debug, schemars::JsonSchema)]
@@ -626,9 +637,20 @@ pub async fn decode_call_frame<T: Triedb>(
             // If logs were requested and there were none stored with the call
             // frame, this RPC call should be rejected.
             if frame.logs.is_none() {
-                return Err(JsonRpcError::internal_error(
-                    "logs not found in call frame".to_string(),
-                ));
+                if matches!(frame.typ, CallKind::SelfDestruct) {
+                    // Fix up a bug for historical traces, where the logs for
+                    // SELFDESTRUCT were stored as None instead of an empty
+                    // vector, causing decoding to fail if any frames in a call
+                    // contained a selfdestruct. This is safe to do, because if
+                    // the transaction is a historical one where there
+                    // legitimately were no logs stored, then one of the other
+                    // frames will cause decoding to fail on a None log entry.
+                    frame.logs = Some(Vec::new());
+                } else {
+                    return Err(JsonRpcError::internal_error(
+                        "logs not found in call frame".to_string(),
+                    ));
+                }
             }
         } else {
             // Logs are stored in TrieDB by default; if the RPC request didn't ask for

@@ -74,6 +74,24 @@ pub struct ValidatorsConfigFile<SCT: SignatureCollection> {
     pub validator_sets: Vec<ValidatorSetDataWithEpoch<SCT>>,
 }
 
+impl<SCT> From<&ValidatorsConfig<SCT>> for ValidatorsConfigFile<SCT>
+where
+    SCT: SignatureCollection,
+{
+    fn from(config: &ValidatorsConfig<SCT>) -> Self {
+        Self {
+            validator_sets: config
+                .validators
+                .iter()
+                .map(|(&epoch, vset)| ValidatorSetDataWithEpoch {
+                    epoch,
+                    validators: vset.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl<SCT: SignatureCollection> ValidatorsConfig<SCT> {
     pub fn read_from_path(validators_path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
         let contents = std::fs::read_to_string(validators_path)?;
@@ -88,7 +106,18 @@ impl<SCT: SignatureCollection> ValidatorsConfig<SCT> {
             validators: validators_config
                 .validator_sets
                 .into_iter()
-                .map(|validator| (validator.epoch, validator.validators))
+                .map(|validator_set| {
+                    assert!(
+                        validator_set
+                            .validators
+                            .get_stakes()
+                            .iter()
+                            .all(|(_, stake)| *stake > Stake::ZERO),
+                        "validators should have non-zero stake"
+                    );
+
+                    (validator_set.epoch, validator_set.validators)
+                })
                 .collect(),
         })
     }
@@ -195,6 +224,19 @@ impl<SCT: SignatureCollection> ValidatorSetData<SCT> {
                      stake: _,
                      cert_pubkey,
                  }| (*node_id, *cert_pubkey),
+            )
+            .collect()
+    }
+
+    pub fn get_pubkeys(&self) -> Vec<NodeId<SCT::NodeIdPubKey>> {
+        self.0
+            .iter()
+            .map(
+                |ValidatorData {
+                     node_id,
+                     stake: _,
+                     cert_pubkey: _,
+                 }| *node_id,
             )
             .collect()
     }

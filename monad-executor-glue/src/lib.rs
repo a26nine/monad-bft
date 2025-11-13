@@ -66,8 +66,12 @@ pub enum RouterCommand<ST: CertificateSignatureRecoverable, OM> {
         message: OM,
         priority: UdpPriority,
     },
+    // Primary publishing embeds epoch as group_id in chunk header. Secondary
+    // publishing embeds round as group_id in chunk header, as rebroadcasting
+    // periods are defined in rounds
     PublishToFullNodes {
-        epoch: Epoch, // Epoch gets embedded into the raptorcast message
+        epoch: Epoch,
+        round: Round,
         message: OM,
     },
     AddEpochValidatorSet {
@@ -103,9 +107,14 @@ impl<ST: CertificateSignatureRecoverable, OM> Debug for RouterCommand<ST, OM> {
                 .field("target", target)
                 .field("priority", priority)
                 .finish(),
-            Self::PublishToFullNodes { epoch, message: _ } => f
+            Self::PublishToFullNodes {
+                epoch,
+                round,
+                message: _,
+            } => f
                 .debug_struct("PublishToFullNodes")
                 .field("epoch", epoch)
+                .field("round", round)
                 .finish(),
             Self::AddEpochValidatorSet {
                 epoch,
@@ -466,6 +475,8 @@ where
         ),
     ),
     StartExecution,
+    /// Expand the set of peers the statesync client can sync from
+    ExpandUpstreamPeers(Vec<NodeId<CertificateSignaturePubKey<ST>>>),
 }
 
 #[derive(Debug)]
@@ -885,11 +896,6 @@ where
     SelfResponse {
         response: BlockSyncResponseMessage<ST, SCT, EPT>,
     },
-    /// Events for secondary raptorcast updates
-    SecondaryRaptorcastPeersUpdate {
-        expiry_round: Round,
-        confirm_group_peers: Vec<NodeId<SCT::NodeIdPubKey>>,
-    },
 }
 
 impl<ST, SCT, EPT> Debug for BlockSyncEvent<ST, SCT, EPT>
@@ -929,14 +935,6 @@ where
             Self::SelfResponse { response } => f
                 .debug_struct("BlockSyncSelfResponse")
                 .field("response", response)
-                .finish(),
-            Self::SecondaryRaptorcastPeersUpdate {
-                expiry_round,
-                confirm_group_peers,
-            } => f
-                .debug_struct("BlockSyncSecondaryRaptorcastEvent")
-                .field("expiry_round", expiry_round)
-                .field("confirm_group_peers", confirm_group_peers)
                 .finish(),
             Self::Timeout(request) => f.debug_struct("Timeout").field("request", request).finish(),
         }
@@ -979,13 +977,6 @@ where
             }
             Self::SelfResponse { response } => {
                 let enc: [&dyn Encodable; 2] = [&6u8, &response];
-                encode_list::<_, dyn Encodable>(&enc, out);
-            }
-            Self::SecondaryRaptorcastPeersUpdate {
-                expiry_round,
-                confirm_group_peers,
-            } => {
-                let enc: [&dyn Encodable; 3] = [&7u8, &expiry_round, &confirm_group_peers];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
         }
@@ -1033,14 +1024,6 @@ where
             6 => {
                 let response = BlockSyncResponseMessage::<ST, SCT, EPT>::decode(&mut payload)?;
                 Ok(Self::SelfResponse { response })
-            }
-            7 => {
-                let expiry_round = Round::decode(&mut payload)?;
-                let confirm_group_peers = Vec::<NodeId<SCT::NodeIdPubKey>>::decode(&mut payload)?;
-                Ok(Self::SecondaryRaptorcastPeersUpdate {
-                    expiry_round,
-                    confirm_group_peers,
-                })
             }
             _ => Err(alloy_rlp::Error::Custom(
                 "failed to decode unknown BlockSyncEvent",
@@ -1675,6 +1658,7 @@ pub enum StateSyncNetworkMessage {
     Response(StateSyncResponse),
     BadVersion(StateSyncBadVersion),
     Completion(SessionId),
+    NotWhitelisted,
 }
 
 impl Encodable for StateSyncNetworkMessage {
@@ -1695,6 +1679,10 @@ impl Encodable for StateSyncNetworkMessage {
             }
             Self::Completion(session_id) => {
                 let enc: [&dyn Encodable; 3] = [&name, &4u8, &session_id];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            Self::NotWhitelisted => {
+                let enc: [&dyn Encodable; 2] = [&name, &5u8];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
         }
@@ -1719,6 +1707,10 @@ impl Encodable for StateSyncNetworkMessage {
                 let enc: Vec<&dyn Encodable> = vec![&name, &4u8, &session_id];
                 Encodable::length(&enc)
             }
+            Self::NotWhitelisted => {
+                let enc: Vec<&dyn Encodable> = vec![&name, &5u8];
+                Encodable::length(&enc)
+            }
         }
     }
 }
@@ -1738,6 +1730,7 @@ impl Decodable for StateSyncNetworkMessage {
             2 => Ok(Self::Response(StateSyncResponse::decode(&mut payload)?)),
             3 => Ok(Self::BadVersion(StateSyncBadVersion::decode(&mut payload)?)),
             4 => Ok(Self::Completion(SessionId::decode(&mut payload)?)),
+            5 => Ok(Self::NotWhitelisted),
             _ => Err(alloy_rlp::Error::Custom(
                 "failed to decode unknown StateSyncNetworkMessage",
             )),
@@ -2019,6 +2012,11 @@ where
     StateSyncEvent(StateSyncEvent<ST, SCT, EPT>),
     /// Config updates
     ConfigEvent(ConfigEvent<ST, SCT>),
+    /// Secondary raptorcast updates
+    SecondaryRaptorcastPeersUpdate {
+        expiry_round: Round,
+        confirm_group_peers: Vec<NodeId<SCT::NodeIdPubKey>>,
+    },
 }
 
 impl<ST, SCT, EPT> MonadEvent<ST, SCT, EPT>
@@ -2071,6 +2069,13 @@ where
                 MonadEvent::StateSyncEvent(event)
             }
             MonadEvent::ConfigEvent(event) => MonadEvent::ConfigEvent(event.clone()),
+            MonadEvent::SecondaryRaptorcastPeersUpdate {
+                expiry_round,
+                confirm_group_peers,
+            } => MonadEvent::SecondaryRaptorcastPeersUpdate {
+                expiry_round: *expiry_round,
+                confirm_group_peers: confirm_group_peers.clone(),
+            },
         }
     }
 }
@@ -2115,6 +2120,13 @@ where
                 let enc: [&dyn Encodable; 2] = [&8u8, &event];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
+            Self::SecondaryRaptorcastPeersUpdate {
+                expiry_round,
+                confirm_group_peers,
+            } => {
+                let enc: [&dyn Encodable; 3] = [&9u8, &expiry_round, &confirm_group_peers];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
         }
     }
 }
@@ -2150,6 +2162,14 @@ where
             8 => Ok(Self::ConfigEvent(ConfigEvent::<ST, SCT>::decode(
                 &mut payload,
             )?)),
+            9 => {
+                let expiry_round = Round::decode(&mut payload)?;
+                let confirm_group_peers = Vec::<NodeId<SCT::NodeIdPubKey>>::decode(&mut payload)?;
+                Ok(Self::SecondaryRaptorcastPeersUpdate {
+                    expiry_round,
+                    confirm_group_peers,
+                })
+            }
             _ => Err(alloy_rlp::Error::Custom(
                 "failed to decode unknown MonadEvent",
             )),
@@ -2220,6 +2240,9 @@ where
             MonadEvent::TimestampUpdateEvent(t) => format!("MempoolEvent::TimestampUpdate: {t}"),
             MonadEvent::StateSyncEvent(_) => "STATESYNC".to_string(),
             MonadEvent::ConfigEvent(_) => "CONFIGEVENT".to_string(),
+            MonadEvent::SecondaryRaptorcastPeersUpdate { .. } => {
+                "SecondaryRaptorcastPeersUpdate".to_string()
+            }
         };
 
         write!(f, "{}", s)

@@ -44,13 +44,23 @@ pub(crate) struct TrackedTxLimitsConfig {
 }
 
 impl TrackedTxLimitsConfig {
-    pub fn new(soft_tx_expiry: Duration, hard_tx_expiry: Duration) -> Self {
-        Self {
-            max_addresses: DEFAULT_MAX_ADDRESSES,
-            max_txs: DEFAULT_MAX_TXS,
-            max_eip2718_bytes: DEFAULT_MAX_EIP2718_BYTES,
+    pub fn new(
+        max_addresses: Option<usize>,
+        max_txs: Option<usize>,
+        max_eip2718_bytes: Option<u64>,
 
-            soft_evict_addresses_watermark: DEFAULT_MAX_ADDRESSES - 512,
+        soft_evict_addresses_watermark: Option<usize>,
+
+        soft_tx_expiry: Duration,
+        hard_tx_expiry: Duration,
+    ) -> Self {
+        Self {
+            max_addresses: max_addresses.unwrap_or(DEFAULT_MAX_ADDRESSES),
+            max_txs: max_txs.unwrap_or(DEFAULT_MAX_TXS),
+            max_eip2718_bytes: max_eip2718_bytes.unwrap_or(DEFAULT_MAX_EIP2718_BYTES),
+
+            soft_evict_addresses_watermark: soft_evict_addresses_watermark
+                .unwrap_or(DEFAULT_MAX_ADDRESSES - 512),
 
             soft_tx_expiry,
             hard_tx_expiry,
@@ -77,7 +87,8 @@ impl TrackedTxLimits {
     }
 
     pub fn build_txs_map<V>(&self) -> IndexMap<Address, V> {
-        IndexMap::with_capacity(self.config.max_addresses)
+        // During insertion, the map can temporarily surpass its max size by 1 address
+        IndexMap::with_capacity(self.config.max_addresses + 1)
     }
 
     pub fn expiry_duration_during_evict(&self) -> Duration {
@@ -93,26 +104,15 @@ impl TrackedTxLimits {
         self.config.hard_tx_expiry
     }
 
-    pub fn can_add_address(&self, addresses: usize) -> bool {
-        addresses < self.config.max_addresses
+    pub fn is_exceeding_limits(&self, addresses: usize) -> bool {
+        addresses > self.config.max_addresses
+            || self.txs > self.config.max_txs
+            || self.eip2718_bytes > self.config.max_eip2718_bytes
     }
 
-    pub fn add_tx(&mut self, tx: &ValidEthTransaction) -> bool {
-        let txs = self.txs + 1;
-        let eip2718_bytes = self.eip2718_bytes + tx.raw().eip2718_encoded_length() as u64;
-
-        if txs > self.config.max_txs {
-            return false;
-        }
-
-        if eip2718_bytes > self.config.max_eip2718_bytes {
-            return false;
-        }
-
-        self.txs = txs;
-        self.eip2718_bytes = eip2718_bytes;
-
-        true
+    pub fn add_tx(&mut self, tx: &ValidEthTransaction) {
+        self.txs += 1;
+        self.eip2718_bytes += tx.raw().eip2718_encoded_length() as u64;
     }
 
     pub fn remove_tx(&mut self, tx: &ValidEthTransaction) {
@@ -134,5 +134,10 @@ impl TrackedTxLimits {
         for tx in txs {
             self.remove_tx(tx)
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.txs = 0;
+        self.eip2718_bytes = 0;
     }
 }
