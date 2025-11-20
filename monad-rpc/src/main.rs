@@ -274,12 +274,14 @@ async fn main() -> std::io::Result<()> {
         timeout_sec: args.eth_trace_block_executor_queuing_timeout,
         queue_limit: args.eth_trace_block_max_concurrent_requests,
     };
+    let tx_exec_num_fibers = args.eth_trace_tx_executor_fibers;
 
     let eth_call_executor = args.triedb_path.clone().as_deref().map(|path| {
         Arc::new(EthCallExecutor::new(
             low_pool_config,
             high_pool_config,
             block_pool_config,
+            tx_exec_num_fibers,
             args.eth_call_executor_node_lru_max_mem,
             path,
         ))
@@ -409,7 +411,7 @@ async fn main() -> std::io::Result<()> {
         })
         .bind((args.rpc_addr, args.rpc_port))?
         .shutdown_timeout(1)
-        .workers(2)
+        .workers(args.worker_threads)
         .run(),
         None => HttpServer::new(move || {
             App::new()
@@ -421,7 +423,7 @@ async fn main() -> std::io::Result<()> {
         })
         .bind((args.rpc_addr, args.rpc_port))?
         .shutdown_timeout(1)
-        .workers(2)
+        .workers(args.worker_threads)
         .run(),
     };
 
@@ -448,6 +450,7 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
     use actix_http::{Request, StatusCode};
     use actix_web::{
         body::{to_bytes, MessageBody},

@@ -20,7 +20,6 @@ use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use auto_impl::auto_impl;
 use bytes::Bytes;
 use monad_chain_config::{
-    execution_revision::MonadExecutionRevision,
     revision::{ChainRevision, MockChainRevision},
     ChainConfig, MockChainConfig,
 };
@@ -37,7 +36,6 @@ use monad_validator::signature_collection::SignatureCollection;
 use serde::Serialize;
 
 use crate::{
-    block_validator::BlockValidationError,
     checkpoint::RootInfo,
     payload::{ConsensusBlockBody, ConsensusBlockBodyId, RoundSignature},
     quorum_certificate::QuorumCertificate,
@@ -357,38 +355,10 @@ pub struct TxnFee {
     pub max_gas_cost: Balance,
     pub max_txn_cost: Balance, // Used for pre TFM validation
     pub is_delegated: bool,
+    pub delegation_before_first_txn: bool,
 }
 
 pub type TxnFees = BTreeMap<Address, TxnFee>;
-
-pub trait BlockPolicyBlockValidator<CRT>
-where
-    Self: Sized,
-    CRT: ChainRevision,
-{
-    type Transaction;
-
-    fn new(
-        block_seq_num: SeqNum,
-        execution_delay: SeqNum,
-        base_fee: u64,
-        chain_revision: &CRT,
-        execution_chain_revision: &MonadExecutionRevision,
-    ) -> Result<Self, BlockPolicyError>;
-
-    fn try_apply_block_fees(
-        &self,
-        account_balance: &mut AccountBalanceState,
-        fees: &TxnFee,
-        eth_address: &Address,
-    ) -> Result<(), BlockPolicyError>;
-
-    fn try_add_transaction(
-        &self,
-        account_balances: &mut BTreeMap<&Address, AccountBalanceState>,
-        txn: &Self::Transaction,
-    ) -> Result<(), BlockPolicyError>;
-}
 
 /// Trait that represents how inner contents of a block should be validated
 #[auto_impl(Box)]
@@ -562,6 +532,11 @@ where
 {
 }
 
+#[derive(Debug)]
+pub enum ConsensusFullBlockError {
+    HeaderPayloadMismatch,
+}
+
 impl<ST, SCT, EPT> ConsensusFullBlock<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
@@ -571,9 +546,9 @@ where
     pub fn new(
         header: ConsensusBlockHeader<ST, SCT, EPT>,
         body: ConsensusBlockBody<EPT>,
-    ) -> Result<Self, BlockValidationError> {
+    ) -> Result<Self, ConsensusFullBlockError> {
         if body.get_id() != header.block_body_id {
-            return Err(BlockValidationError::HeaderPayloadMismatchError);
+            return Err(ConsensusFullBlockError::HeaderPayloadMismatch);
         }
         Ok(Self { header, body })
     }

@@ -35,7 +35,7 @@ use monad_consensus_types::{
     block::{
         BlockPolicy, BlockRange, ConsensusBlockHeader, ConsensusFullBlock, OptimisticPolicyCommit,
     },
-    block_validator::{BlockValidationError, BlockValidator},
+    block_validator::BlockValidator,
     checkpoint::{Checkpoint, LockedEpoch, RootInfo},
     metrics::Metrics,
     no_endorsement::{FreshProposalCertificate, NoEndorsement},
@@ -583,74 +583,16 @@ where
             body,
             Some(author_pubkey),
             &self.config.chain_config,
+            self.metrics,
         ) {
             Ok(block) => block,
-            Err(BlockValidationError::SystemTxnError) => {
+            Err(err) => {
                 warn!(
                     ?block_round,
                     ?block_author,
                     ?seq_num,
-                    "dropping proposal, system transaction validation failed"
-                );
-                self.metrics.consensus_events.failed_txn_validation += 1;
-                return None;
-            }
-            Err(BlockValidationError::TxnError) => {
-                warn!(
-                    ?block_round,
-                    ?block_author,
-                    ?seq_num,
-                    "dropping proposal, transaction validation failed"
-                );
-                self.metrics.consensus_events.failed_txn_validation += 1;
-                return None;
-            }
-            Err(BlockValidationError::RandaoError) => {
-                warn!(
-                    ?block_round,
-                    ?block_author,
-                    ?seq_num,
-                    "dropping proposal, randao validation failed"
-                );
-                self.metrics
-                    .consensus_events
-                    .failed_verify_randao_reveal_sig += 1;
-                return None;
-            }
-            Err(BlockValidationError::HeaderPayloadMismatchError) => {
-                // TODO: this is malicious behaviour?
-                warn!(
-                    ?block_round,
-                    ?block_author,
-                    ?seq_num,
-                    "dropping proposal, header payload mismatch"
-                );
-                return None;
-            }
-            Err(BlockValidationError::PayloadError) => {
-                warn!(
-                    ?block_round,
-                    ?block_author,
-                    ?seq_num,
-                    "dropping proposal, payload validation failed"
-                );
-                return None;
-            }
-            Err(BlockValidationError::HeaderError) => {
-                warn!(
-                    ?block_round,
-                    ?block_author,
-                    ?seq_num,
-                    "dropping proposal, header validation failed"
-                );
-                return None;
-            }
-            Err(BlockValidationError::TimestampError) => {
-                warn!(
-                    ?block_round,
-                    ?block_author,
-                    ?seq_num,
-                    "dropping proposal, timestamp validation failed"
+                    ?err,
+                    "dropping proposal, block validation failed"
                 );
                 return None;
             }
@@ -1237,12 +1179,12 @@ where
 
         // update vote_state round
         // it's ok if not leader for round; we will never propose
-        self.consensus
-            .vote_state
-            .start_new_round(self.consensus.pacemaker.get_current_round());
-        self.consensus
-            .no_endorsement_state
-            .start_new_round(self.consensus.pacemaker.get_current_round());
+        let round = self.consensus.pacemaker.get_current_round();
+        self.consensus.vote_state.start_new_round(round);
+        self.consensus.no_endorsement_state.start_new_round(round);
+
+        let round_leader = self.lookup_leader(round);
+        debug!(?round, ?round_leader, "leader for round");
 
         cmds.extend(self.try_propose());
 
@@ -1281,6 +1223,10 @@ where
                     )
                 }),
         );
+        let round = self.consensus.pacemaker.get_current_round();
+        let round_leader = self.lookup_leader(round);
+        debug!(?round, ?round_leader, "leader for round");
+
         cmds.extend(self.try_propose());
         cmds
     }
@@ -1881,6 +1827,15 @@ where
         self.compute_upcoming_leader_round_pairs::<false, NUM_LEADERS_FORWARD_TXS>()
             .filter_map(|(nodeid, _)| (nodeid != *self.nodeid).then_some(nodeid))
             .unique()
+    }
+
+    fn lookup_leader(&self, round: Round) -> Option<NodeId<CertificateSignaturePubKey<ST>>> {
+        let epoch = self.epoch_manager.get_epoch(round)?;
+        let validator_set = self.val_epoch_map.get_val_set(&epoch)?;
+        Some(
+            self.election
+                .get_leader(round, epoch, validator_set.get_members()),
+        )
     }
 }
 

@@ -27,6 +27,7 @@ pub mod committed_tx_watcher;
 pub mod gen_harness;
 pub mod metrics;
 pub mod refresher;
+pub mod rpc_request_gen;
 pub mod rpc_sender;
 
 pub use committed_tx_watcher::*;
@@ -171,7 +172,7 @@ pub struct AddrsWithTime {
 
 pub struct AccountsWithTxs {
     pub accts: Accounts,
-    pub txs: Vec<(TxEnvelope, Address)>,
+    pub txs: Vec<(TxEnvelope, Address, crate::shared::private_key::PrivateKey)>,
 }
 
 impl ExactSizeIterator for AccountsIter<'_> {}

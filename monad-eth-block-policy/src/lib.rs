@@ -31,8 +31,8 @@ use monad_chain_config::{
 };
 use monad_consensus_types::{
     block::{
-        AccountBalanceState, BlockPolicy, BlockPolicyBlockValidator,
-        BlockPolicyBlockValidatorError, BlockPolicyError, ConsensusFullBlock, TxnFee, TxnFees,
+        AccountBalanceState, BlockPolicy, BlockPolicyBlockValidatorError, BlockPolicyError,
+        ConsensusFullBlock, TxnFee, TxnFees,
     },
     checkpoint::RootInfo,
 };
@@ -374,14 +374,11 @@ pub fn timestamp_ns_to_secs(timestamp_ns: u128) -> u64 {
     timestamp_seconds.min(u64::MAX.into()) as u64
 }
 
-impl<CRT> BlockPolicyBlockValidator<CRT> for EthBlockPolicyBlockValidator<CRT>
+impl<CRT> EthBlockPolicyBlockValidator<CRT>
 where
-    Self: Sized,
     CRT: ChainRevision,
 {
-    type Transaction = Recovered<TxEnvelope>;
-
-    fn new(
+    pub fn new(
         block_seq_num: SeqNum,
         execution_delay: SeqNum,
         base_fee: u64,
@@ -398,7 +395,7 @@ where
         })
     }
 
-    fn try_apply_block_fees(
+    pub fn try_apply_block_fees(
         &self,
         account_balance: &mut AccountBalanceState,
         block_txn_fees: &TxnFee,
@@ -444,11 +441,13 @@ where
             return Ok(());
         }
 
-        let has_emptying_transaction = is_possibly_emptying_transaction(
+        let is_possibly_emptying_transaction = is_possibly_emptying_transaction(
             self.block_seq_num,
             account_balance,
             self.execution_delay,
         );
+        let has_emptying_transaction =
+            is_possibly_emptying_transaction && !block_txn_fees.delegation_before_first_txn;
 
         let mut block_gas_cost = block_txn_fees.max_gas_cost;
         if has_emptying_transaction {
@@ -525,10 +524,10 @@ where
         Ok(())
     }
 
-    fn try_add_transaction(
+    pub fn try_add_transaction(
         &self,
         account_balances: &mut BTreeMap<&Address, AccountBalanceState>,
-        txn: &Self::Transaction,
+        txn: &ValidatedTx,
     ) -> Result<(), BlockPolicyError> {
         let eth_address = txn.signer();
 
@@ -588,6 +587,13 @@ where
             account_balance,
             self.execution_delay,
         );
+        // if txn is a transaction that also contains an authorization from the sender, we consider
+        // the transaction to be non emptying transaction
+        let contains_self_authorization = txn
+            .authorizations_7702
+            .iter()
+            .any(|auth| auth.authority() == Some(eth_address));
+        let is_emptying_transaction = is_emptying_transaction && !contains_self_authorization;
 
         // if an account for txn T is not delegated and has no prior txns, then T can charge into reserve.
         if is_emptying_transaction {
@@ -650,6 +656,15 @@ where
 
             account_balance.remaining_reserve_balance = reserve_balance;
             account_balance.block_seqnum_of_latest_txn = self.block_seq_num;
+        }
+
+        // update delegation status of authority addresses
+        for recovered_auth in &txn.authorizations_7702 {
+            if let Some(auth_address) = recovered_auth.authority() {
+                if let Some(account_balance) = account_balances.get_mut(&auth_address) {
+                    account_balance.is_delegated = true;
+                }
+            }
         }
 
         Ok(())
@@ -1362,8 +1377,7 @@ where
             return Err(BlockPolicyError::BaseFeeError);
         }
 
-        let (tx_signers, authority_addresses) =
-            self.extract_signers(&block.validated_txns, &block.system_txns)?;
+        let (tx_signers, _) = self.extract_signers(&block.validated_txns, &block.system_txns)?;
 
         // these must be updated as we go through txs in the block
         let mut account_nonces = self.get_account_base_nonces(
@@ -1380,15 +1394,6 @@ where
             Some(&extending_blocks),
             tx_signers.iter(),
         )?;
-
-        for authority in &authority_addresses {
-            let account_balance = account_balances
-                .get_mut(authority)
-                .expect("account_balances should have been populated for delegated accounts");
-
-            trace!(?authority, "Setting account to is_delegated: true");
-            account_balance.is_delegated = true;
-        }
 
         let validator = EthBlockPolicyBlockValidator::new(
             block.get_seq_num(),
@@ -1475,7 +1480,7 @@ mod test {
     use std::collections::HashMap;
 
     use alloy_consensus::{SignableTransaction, TxEip1559};
-    use alloy_eips::eip7702::Authorization;
+    use alloy_eips::eip7702::{Authorization, RecoveredAuthority};
     use alloy_primitives::{Address, FixedBytes, PrimitiveSignature, TxKind, B256};
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
@@ -1560,6 +1565,33 @@ mod test {
                 .collect(),
             0, // input length
         ))
+    }
+
+    fn make_validated_tx(tx: Recovered<TxEnvelope>) -> ValidatedTx {
+        if let Some(txn_7702) = tx.as_eip7702() {
+            let authorizations_7702: Vec<RecoveredAuthorization> = txn_7702
+                .tx()
+                .authorization_list
+                .iter()
+                .filter_map(|signed_auth| {
+                    signed_auth.recover_authority().ok().map(|authority| {
+                        RecoveredAuthorization::new_unchecked(
+                            signed_auth.inner().clone(),
+                            RecoveredAuthority::Valid(authority),
+                        )
+                    })
+                })
+                .collect();
+            ValidatedTx {
+                tx,
+                authorizations_7702,
+            }
+        } else {
+            ValidatedTx {
+                tx,
+                authorizations_7702: Vec::new(),
+            }
+        }
     }
 
     pub fn make_test_block(
@@ -2196,6 +2228,242 @@ mod test {
             CoherencyCheckMode::ReserveBalanceCoherency,
         );
         assert!(result.is_ok(), "Block coherency check failed: {:?}", result);
+
+        /////////////////////////////////////////////////////////////////////////////
+        // Case8: Emptying transactions then delegation later in the same block   ///
+        /////////////////////////////////////////////////////////////////////////////
+
+        // first tx is an emptying transaction that transfer out all balance
+        // second tx has insufficient reserve balance to include gas cost
+        // third tx is a delegation transaction by sender of first two txns
+        let tx1 = make_test_tx(50000, HALF_ETHER, 0, S1);
+        let tx2 = make_test_tx(50000, HALF_ETHER, 1, S1);
+        let tx3 = make_test_delegation_tx(
+            50000,
+            0,
+            0,
+            S2,
+            HashMap::from([(
+                S1,
+                Authorization {
+                    chain_id: CHAIN_ID,
+                    nonce: 2,
+                    address: Address(FixedBytes([0x11; 20])),
+                },
+            )]),
+        );
+        let signer1 = tx1.signer();
+        let signer2 = tx3.signer();
+        let txs = BTreeMap::from([(4, vec![tx1, tx2, tx3])]);
+
+        // balance of signer at block n-3
+        let gas_cost = 50000 * BASE_FEE as u128;
+        let state_backend = NopStateBackend {
+            balances: BTreeMap::from([
+                (signer1, U256::from(gas_cost + HALF_ETHER)),
+                (signer2, U256::from(gas_cost)),
+            ]),
+            ..Default::default()
+        };
+
+        let result = setup_block_policy_with_txs(
+            txs,
+            vec![signer1, signer2],
+            &state_backend,
+            num_committed_blocks,
+            CoherencyCheckMode::ReserveBalanceCoherency,
+        );
+        assert_eq!(
+            result,
+            Err(BlockPolicyError::BlockPolicyBlockValidatorError(
+                BlockPolicyBlockValidatorError::InsufficientReserveBalance
+            )),
+            "Block coherency check should have failed: {:?}",
+            result
+        );
+
+        /////////////////////////////////////////////////////////////////////////////
+        // Case9: Delegation and transfer transaction in the same transaction     ///
+        /////////////////////////////////////////////////////////////////////////////
+
+        // transaction contains a delegation and also a transfer
+        // transaction considered as non-emptying
+        let gas_limit = RESERVE_BALANCE as u64 / BASE_FEE + 1;
+        let tx = make_test_delegation_tx(
+            gas_limit,
+            HALF_ETHER,
+            0,
+            S1,
+            HashMap::from([(
+                S1,
+                Authorization {
+                    chain_id: CHAIN_ID,
+                    nonce: 1,
+                    address: Address(FixedBytes([0x11; 20])),
+                },
+            )]),
+        );
+        let signer = tx.signer();
+        let txs = BTreeMap::from([(4, vec![tx])]);
+
+        // balance of signer at block n-3
+        let state_backend = NopStateBackend {
+            balances: BTreeMap::from([(signer, U256::from(2 * RESERVE_BALANCE))]),
+            ..Default::default()
+        };
+
+        // although the signer has sufficient balance, as the transaction is considered reserve balance
+        // gas cost that exceeds reserve balance is rejected
+        let result = setup_block_policy_with_txs(
+            txs,
+            vec![signer],
+            &state_backend,
+            num_committed_blocks,
+            CoherencyCheckMode::ReserveBalanceCoherency,
+        );
+        assert_eq!(
+            result,
+            Err(BlockPolicyError::BlockPolicyBlockValidatorError(
+                BlockPolicyBlockValidatorError::InsufficientReserveBalance
+            )),
+            "Block coherency check should have failed: {:?}",
+            result
+        );
+
+        /////////////////////////////////////////////////////////////////////////////
+        // Case10: Delegation with invalid chain id, non emptying transaction     ///
+        /////////////////////////////////////////////////////////////////////////////
+
+        // first tx is a delegation with invalid chain id
+        // it still counts towards has_delegated
+        // which makes the second tx non-emptying
+        let tx1 = make_test_delegation_tx(
+            50000,
+            0,
+            0,
+            S1,
+            HashMap::from([(
+                S2,
+                Authorization {
+                    chain_id: CHAIN_ID + 1, // invalid chain id
+                    nonce: 0,
+                    address: Address(FixedBytes([0x11; 20])),
+                },
+            )]),
+        );
+        let gas_limit = RESERVE_BALANCE as u64 / BASE_FEE + 1;
+        let tx2 = make_test_tx(gas_limit, HALF_ETHER, 1, S2);
+
+        let signer1 = tx1.signer();
+        let signer2 = tx2.signer();
+        let txs = BTreeMap::from([(4, vec![tx1, tx2])]);
+
+        // balance of signer at block n-3
+        let gas_cost = 50000 * BASE_FEE as u128;
+        let state_backend = NopStateBackend {
+            balances: BTreeMap::from([
+                (signer1, U256::from(gas_cost)),
+                (signer2, U256::from(2 * RESERVE_BALANCE)),
+            ]),
+            ..Default::default()
+        };
+
+        let result = setup_block_policy_with_txs(
+            txs,
+            vec![signer1, signer2],
+            &state_backend,
+            num_committed_blocks,
+            CoherencyCheckMode::ReserveBalanceCoherency,
+        );
+        assert_eq!(
+            result,
+            Err(BlockPolicyError::BlockPolicyBlockValidatorError(
+                BlockPolicyBlockValidatorError::InsufficientReserveBalance
+            )),
+            "Block coherency check should have failed: {:?}",
+            result
+        );
+
+        /////////////////////////////////////////////////////////////////////////////
+        // Case11: Delegation then multi block transactions                       ///
+        /////////////////////////////////////////////////////////////////////////////
+
+        // first tx is a delegation by sender S1
+        let tx1 = make_test_delegation_tx(
+            50000,
+            0,
+            0,
+            S2,
+            HashMap::from([(
+                S1,
+                Authorization {
+                    chain_id: CHAIN_ID,
+                    nonce: 0,
+                    address: Address(FixedBytes([0x11; 20])),
+                },
+            )]),
+        );
+        // second tx is non-emptying transaction (gas cost of full reserve balance)
+        let gas_limit = RESERVE_BALANCE as u64 / BASE_FEE;
+        let tx2 = make_test_tx(gas_limit, 0, 1, S1);
+        // third tx is non emptying transaction (gas cost exceeds reserve balance)
+        let tx3 = make_test_tx(50000, 0, 2, S1);
+
+        let signer1 = tx2.signer();
+        let signer2 = tx1.signer();
+        let txs = BTreeMap::from([(3, vec![tx1.clone(), tx2]), (4, vec![tx3])]);
+
+        // balance of signer at block n-3
+        let gas_cost = 50000 * BASE_FEE as u128;
+        let state_backend = NopStateBackend {
+            balances: BTreeMap::from([
+                (signer1, U256::from(2 * RESERVE_BALANCE)),
+                (signer2, U256::from(gas_cost)),
+            ]),
+            ..Default::default()
+        };
+
+        let result = setup_block_policy_with_txs(
+            txs,
+            vec![signer1, signer2],
+            &state_backend,
+            num_committed_blocks,
+            CoherencyCheckMode::ReserveBalanceCoherency,
+        );
+        assert_eq!(
+            result,
+            Err(BlockPolicyError::BlockPolicyBlockValidatorError(
+                BlockPolicyBlockValidatorError::InsufficientReserveBalance
+            )),
+            "Block coherency check should have failed: {:?}",
+            result
+        );
+
+        // second tx is non-emptying transaction (transfer value of half ether)
+        let tx2 = make_test_tx(50000, HALF_ETHER, 1, S1);
+        // third tx is non emptying transaction
+        let tx3 = make_test_tx(50000, 0, 2, S1);
+
+        let txs = BTreeMap::from([(3, vec![tx1, tx2]), (4, vec![tx3])]);
+
+        // balance of signer at block n-3
+        let gas_cost = 2 * 50000 * BASE_FEE as u128;
+        let state_backend = NopStateBackend {
+            balances: BTreeMap::from([
+                (signer1, U256::from(gas_cost)),
+                (signer2, U256::from(gas_cost)),
+            ]),
+            ..Default::default()
+        };
+
+        let result = setup_block_policy_with_txs(
+            txs,
+            vec![signer1, signer2],
+            &state_backend,
+            num_committed_blocks,
+            CoherencyCheckMode::ReserveBalanceCoherency,
+        );
+        assert!(result.is_ok(), "Block coherency check failed: {:?}", result);
     }
 
     #[test_case(3; "three committed blocks, one extending block")]
@@ -2450,6 +2718,7 @@ mod test {
                             max_gas_cost: Balance::from(90),
                             max_txn_cost: Balance::ZERO,
                             is_delegated: false,
+                            delegation_before_first_txn: false,
                         },
                     ),
                     (
@@ -2460,6 +2729,7 @@ mod test {
                             max_gas_cost: Balance::from(190),
                             max_txn_cost: Balance::ZERO,
                             is_delegated: false,
+                            delegation_before_first_txn: false,
                         },
                     ),
                 ]),
@@ -2492,6 +2762,7 @@ mod test {
                             max_gas_cost: Balance::from(140),
                             max_txn_cost: Balance::ZERO,
                             is_delegated: false,
+                            delegation_before_first_txn: false,
                         },
                     ),
                     (
@@ -2502,6 +2773,7 @@ mod test {
                             max_gas_cost: Balance::from(290),
                             max_txn_cost: Balance::ZERO,
                             is_delegated: false,
+                            delegation_before_first_txn: false,
                         },
                     ),
                 ]),
@@ -2534,6 +2806,7 @@ mod test {
                             max_gas_cost: Balance::from(240),
                             max_txn_cost: Balance::ZERO,
                             is_delegated: false,
+                            delegation_before_first_txn: false,
                         },
                     ),
                     (
@@ -2544,6 +2817,7 @@ mod test {
                             max_gas_cost: Balance::from(0),
                             max_txn_cost: Balance::ZERO,
                             is_delegated: false,
+                            delegation_before_first_txn: false,
                         },
                     ),
                 ]),
@@ -2667,6 +2941,7 @@ mod test {
         let block_seq_num = latest_seq_num + EXEC_DELAY;
 
         let tx = make_test_tx(50000, txn_value, 0, S1);
+        let tx = make_validated_tx(tx);
         let txs = vec![tx.clone()];
         let signer = tx.recover_signer().unwrap();
         let min_balance = compute_txn_max_gas_cost(&tx, BASE_FEE);
@@ -2737,6 +3012,7 @@ mod test {
         let block_seq_num = latest_seq_num + EXEC_DELAY - SeqNum(1);
 
         let tx = make_test_tx(50000, txn_value, 0, S1);
+        let tx = make_validated_tx(tx);
         let txs = vec![tx.clone()];
         let signer = tx.recover_signer().unwrap();
         let min_balance = compute_txn_max_gas_cost(&tx, BASE_FEE);
@@ -2807,6 +3083,7 @@ mod test {
         let block_seq_num = latest_seq_num + EXEC_DELAY;
 
         let tx = make_test_tx(50000, txn_value, 0, S1);
+        let tx = make_validated_tx(tx);
         let txs = vec![tx.clone()];
         let min_balance = compute_txn_max_gas_cost(&tx, BASE_FEE);
 
@@ -2851,6 +3128,7 @@ mod test {
         let block_seq_num = latest_seq_num + EXEC_DELAY;
 
         let tx = make_test_tx(50000, txn_value, 0, S1);
+        let tx = make_validated_tx(tx);
         let txs = vec![tx.clone()];
         let signer = tx.recover_signer().unwrap();
         let min_balance = compute_txn_max_value(&tx, BASE_FEE);
@@ -2922,7 +3200,9 @@ mod test {
         let block_seq_num = latest_seq_num + EXEC_DELAY;
 
         let tx1 = make_test_tx(50000, txn_value, 0, S1);
+        let tx1 = make_validated_tx(tx1);
         let tx2 = make_test_tx(50000, txn_value * 2, 1, S1);
+        let tx2 = make_validated_tx(tx2);
         let signer = tx1.recover_signer().unwrap();
 
         let txs = vec![tx1.clone(), tx2.clone()];
@@ -3047,6 +3327,7 @@ mod test {
         };
 
         let txn = make_test_eip1559_tx(txn_value, 0, txn_gas_limit, S1);
+        let txn = make_validated_tx(txn);
         let signer = txn.recover_signer().unwrap();
 
         let mut account_balances: BTreeMap<&Address, AccountBalanceState> = BTreeMap::new();
@@ -3296,6 +3577,7 @@ mod test {
         txn: &Recovered<TxEnvelope>,
         expect: Result<(), BlockPolicyError>,
     ) {
+        let txn = &make_validated_tx(txn.clone());
         let validator = EthBlockPolicyBlockValidator::new(
             block_seq_num,
             EXEC_DELAY,
@@ -3329,6 +3611,7 @@ mod test {
         first_txn_gas: u64,
         max_gas_cost: u64,
         is_delegated: bool,
+        delegation_before_first_txn: bool,
     ) -> TxnFee {
         TxnFee {
             first_txn_value: Balance::from(first_txn_value),
@@ -3336,6 +3619,7 @@ mod test {
             max_gas_cost: Balance::from(max_gas_cost),
             max_txn_cost: Balance::ZERO,
             is_delegated,
+            delegation_before_first_txn,
         }
     }
 
@@ -3444,7 +3728,7 @@ mod test {
 
         let blk_fees = blk_fees
             .into_iter()
-            .map(|x| make_txn_fees(x.0, x.1, x.2, false))
+            .map(|x| make_txn_fees(x.0, x.1, x.2, false, false))
             .collect_vec();
 
         for (((fees, expect), seqnum), expected_remaining_reserve) in blk_fees
@@ -3577,7 +3861,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         false,
-        vec![(11, 1, 1, false)],
+        vec![(11, 1, 1, false, false)],
         vec![SeqNum(4)],
         vec![Balance::from(0_u64)],
         vec![false],
@@ -3588,7 +3872,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         true,
-        vec![(11, 1, 1, false)],
+        vec![(11, 1, 1, false, false)],
         vec![SeqNum(4)],
         vec![Balance::from(8_u64)],
         vec![true],
@@ -3599,7 +3883,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         true,
-        vec![(11, 1, 1, true)],
+        vec![(11, 1, 1, true, false)],
         vec![SeqNum(4)],
         vec![Balance::from(8_u64)],
         vec![true],
@@ -3610,7 +3894,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         true,
-        vec![(11, 1, 1, false)],
+        vec![(11, 1, 1, false, false)],
         vec![SeqNum(4)],
         vec![Balance::from(8_u64)],
         vec![true],
@@ -3621,7 +3905,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         false,
-        vec![(11, 1, 10, true), (11, 1, 1, false)],
+        vec![(11, 1, 10, true, false), (11, 1, 1, false, false)],
         vec![SeqNum(4), SeqNum(5)],
         vec![Balance::from(78_u64), Balance::from(76_u64)],
         vec![true, true],
@@ -3632,7 +3916,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         false,
-        vec![(11, 1, 2, true), (11, 1, 1, false), (4, 2, 0, false)],
+        vec![(11, 1, 2, true, false), (11, 1, 1, false, false), (4, 2, 0, false, false)],
         vec![SeqNum(1), SeqNum(2), SeqNum(5)],
         vec![Balance::from(7_u64), Balance::from(5_u64), Balance::from(3_u64)],
         vec![true, true, true],
@@ -3643,7 +3927,7 @@ mod test {
         Balance::from(10),
         SeqNum(1),
         false,
-        vec![(11, 1, 2, false), (11, 1, 1, false), (4, 2, 0, false)],
+        vec![(11, 1, 2, false, false), (11, 1, 1, false, false), (4, 2, 0, false, false)],
         vec![SeqNum(1), SeqNum(2), SeqNum(5)],
         vec![Balance::from(7_u64), Balance::from(5_u64), Balance::from(5_u64)],
         vec![false, false, false],
@@ -3655,7 +3939,7 @@ mod test {
         #[case] reserve_balance: Balance,
         #[case] block_seqnum_of_latest_txn: SeqNum,
         #[case] is_delegated: bool,
-        #[case] blk_fees: Vec<(u64, u64, u64, bool)>, // (first_txn_value, first_txn_gas, max_gas_cost, is_delegated)
+        #[case] blk_fees: Vec<(u64, u64, u64, bool, bool)>, // (first_txn_value, first_txn_gas, max_gas_cost, is_delegated, delegation_before_first_txn)
         #[case] txn_block_num: Vec<SeqNum>,
         #[case] expected_remaining_reserve: Vec<Balance>,
         #[case] expected_is_delegated: Vec<bool>,
@@ -3676,7 +3960,7 @@ mod test {
 
         let blk_fees = blk_fees
             .into_iter()
-            .map(|x| make_txn_fees(x.0, x.1, x.2, x.3))
+            .map(|x| make_txn_fees(x.0, x.1, x.2, x.3, x.4))
             .collect_vec();
 
         for ((((fees, expect), seqnum), expected_remaining_reserve), expected_is_delegated) in

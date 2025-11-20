@@ -75,6 +75,7 @@ use monad_validator::{
     validator_set::{ValidatorSetType, ValidatorSetTypeFactory},
     validators_epoch_mapping::ValidatorsEpochMapping,
 };
+use tracing::warn;
 
 use self::{
     blocksync::BlockSyncChildState, consensus::ConsensusChildState, statesync::BlockBuffer,
@@ -83,6 +84,8 @@ use self::{
 mod blocksync;
 mod consensus;
 mod statesync;
+
+const STATESYNC_BLOCK_THRESHOLD: SeqNum = SeqNum(30_000);
 
 pub(crate) fn handle_validation_error(e: validation::Error, metrics: &mut Metrics) {
     match e {
@@ -1408,6 +1411,21 @@ where
                 "always 1 execution result after first k-1 blocks for now"
             );
 
+            let maybe_latest_finalized_block = self.state_backend.raw_read_latest_finalized_block();
+            if let Some(latest_finalized_block) = maybe_latest_finalized_block {
+                if latest_finalized_block.saturating_add(STATESYNC_BLOCK_THRESHOLD) < delay_seq_num
+                {
+                    warn!(
+                        ?latest_finalized_block,
+                        ?delay_seq_num,
+                        "local tip over {} blocks older than root. consider restoring from snapshot first",
+                        STATESYNC_BLOCK_THRESHOLD.0
+                    );
+                }
+            } else {
+                warn!("starting from empty state, consider fetching a snapshot first");
+            }
+
             self.metrics.consensus_events.trigger_state_sync += 1;
             return vec![Command::StateSyncCommand(StateSyncCommand::RequestSync(
                 delayed_execution_result
@@ -1446,6 +1464,7 @@ where
                         // this is because these blocks are already committed by majority
                         None,
                         &self.consensus_config.chain_config,
+                        &mut self.metrics,
                     )
                     .expect("majority committed invalid block")
             })
