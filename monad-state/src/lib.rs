@@ -104,6 +104,12 @@ pub(crate) fn handle_validation_error(e: validation::Error, metrics: &mut Metric
         validation::Error::DuplicateTcTipRound => {
             metrics.validation_errors.duplicate_tc_tip_round += 1;
         }
+        validation::Error::EmptySignersTcTipRound => {
+            metrics.validation_errors.empty_signers_tc_tip_round += 1;
+        }
+        validation::Error::TooManyTcTipRound => {
+            metrics.validation_errors.too_many_tc_tip_round += 1;
+        }
         validation::Error::InsufficientStake => {
             metrics.validation_errors.insufficient_stake += 1;
         }
@@ -266,7 +272,7 @@ where
             let (vset, vmap) = validators
                 .get(&epoch)
                 .ok_or(validation::Error::ValidatorSetDataUnavailable)?;
-            let leader = election.get_leader(round, epoch, vset.get_members());
+            let leader = election.get_leader(round, vset.get_members());
             Ok((vset, vmap, leader))
         };
 
@@ -1686,7 +1692,7 @@ mod test {
             })
             .collect();
 
-        (forkpoint, validator_sets, WeightedRoundRobin::new(Epoch(1)))
+        (forkpoint, validator_sets, WeightedRoundRobin::default())
     }
 
     #[test]

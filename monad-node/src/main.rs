@@ -17,6 +17,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     marker::PhantomData,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    path::PathBuf,
     process,
     sync::Arc,
     time::{Duration, Instant},
@@ -30,11 +31,8 @@ use monad_chain_config::ChainConfig;
 use monad_consensus_state::ConsensusConfig;
 use monad_consensus_types::{metrics::Metrics, validator_data::ValidatorSetDataWithEpoch};
 use monad_control_panel::ipc::ControlPanelIpcReceiver;
-use monad_crypto::{
-    certificate_signature::{
-        CertificateKeyPair, CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
-    },
-    signing_domain,
+use monad_crypto::certificate_signature::{
+    CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_dataplane::DataplaneBuilder;
 use monad_eth_block_policy::EthBlockPolicy;
@@ -52,7 +50,10 @@ use monad_peer_discovery::{
     MonadNameRecord, NameRecord,
 };
 use monad_pprof::start_pprof_server;
-use monad_raptorcast::config::{RaptorCastConfig, RaptorCastConfigPrimary};
+use monad_raptorcast::{
+    config::{RaptorCastConfig, RaptorCastConfigPrimary},
+    AUTHENTICATED_RAPTORCAST_SOCKET, RAPTORCAST_SOCKET,
+};
 use monad_router_multi::MultiRouter;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
 use monad_state_backend::StateBackendThreadClient;
@@ -171,6 +172,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         locked_epoch_validators.clone(),
         current_epoch,
         current_round,
+        node_state.persisted_peers_path,
     );
 
     let statesync_threshold: usize = node_state.node_config.statesync_threshold.into();
@@ -333,7 +335,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
 
     let builder = MonadStateBuilder {
         validator_set_factory: ValidatorSetFactory::default(),
-        leader_election: WeightedRoundRobin::new(node_state.chain_config.get_staking_activation()),
+        leader_election: WeightedRoundRobin::default(),
         block_validator: EthBlockValidator::default(),
         block_policy: create_block_policy(),
         state_backend,
@@ -507,9 +509,17 @@ fn build_raptorcast_router<ST, SCT, M, OM>(
     locked_epoch_validators: Vec<ValidatorSetDataWithEpoch<SCT>>,
     current_epoch: Epoch,
     current_round: Round,
-) -> MultiRouter<ST, M, OM, MonadEvent<ST, SCT, ExecutionProtocolType>, PeerDiscovery<ST>>
+    persisted_peers_path: PathBuf,
+) -> MultiRouter<
+    ST,
+    M,
+    OM,
+    MonadEvent<ST, SCT, ExecutionProtocolType>,
+    PeerDiscovery<ST>,
+    monad_raptorcast::auth::WireAuthProtocol,
+>
 where
-    ST: CertificateSignatureRecoverable,
+    ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>>
         + Decodable
@@ -523,6 +533,10 @@ where
         IpAddr::V4(node_config.network.bind_address_host),
         node_config.network.bind_address_port,
     );
+    let authenticated_bind_address = node_config
+        .network
+        .authenticated_bind_address_port
+        .map(|port| SocketAddr::new(IpAddr::V4(node_config.network.bind_address_host), port));
     let Some(SocketAddr::V4(name_record_address)) = resolve_domain_v4(
         &NodeId::new(identity.pubkey()),
         &peer_discovery_config.self_address,
@@ -535,6 +549,7 @@ where
 
     tracing::debug!(
         ?bind_address,
+        ?authenticated_bind_address,
         ?name_record_address,
         "Monad-node starting, pid: {}",
         process::id()
@@ -556,12 +571,33 @@ where
             network_config.tcp_rate_limit_burst,
         );
 
+    let mut udp_sockets = vec![monad_dataplane::UdpSocketConfig {
+        socket_addr: bind_address,
+        label: RAPTORCAST_SOCKET.to_string(),
+    }];
+    if let Some(auth_addr) = authenticated_bind_address {
+        udp_sockets.push(monad_dataplane::UdpSocketConfig {
+            socket_addr: auth_addr,
+            label: AUTHENTICATED_RAPTORCAST_SOCKET.to_string(),
+        });
+    }
+    dp_builder = dp_builder.extend_udp_sockets(udp_sockets);
+
     let self_id = NodeId::new(identity.pubkey());
-    let self_record = NameRecord::new(
-        *name_record_address.ip(),
-        name_record_address.port(),
-        peer_discovery_config.self_record_seq_num,
-    );
+    let self_record = match network_config.authenticated_bind_address_port {
+        Some(auth_port) => NameRecord::new_with_authentication(
+            *name_record_address.ip(),
+            name_record_address.port(),
+            network_config.bind_address_port,
+            auth_port,
+            peer_discovery_config.self_record_seq_num,
+        ),
+        None => NameRecord::new(
+            *name_record_address.ip(),
+            network_config.bind_address_port,
+            peer_discovery_config.self_record_seq_num,
+        ),
+    };
     let self_record = MonadNameRecord::new(self_record, &identity);
     assert!(
         self_record.signature == peer_discovery_config.self_name_record_sig,
@@ -584,22 +620,17 @@ where
                     return None;
                 }
             };
-            let name_record = NameRecord::new(*address.ip(), address.port(), peer.record_seq_num);
 
-            // verify signature of name record
-            let mut encoded = Vec::new();
-            name_record.encode(&mut encoded);
-            match peer
-                .name_record_sig
-                .verify::<signing_domain::NameRecord>(&encoded, &peer.secp256k1_pubkey)
-            {
-                Ok(_) => Some((
-                    node_id,
-                    MonadNameRecord {
-                        name_record,
-                        signature: peer.name_record_sig,
-                    },
-                )),
+            let peer_entry = monad_executor_glue::PeerEntry {
+                pubkey: peer.secp256k1_pubkey,
+                addr: address,
+                signature: peer.name_record_sig,
+                record_seq_num: peer.record_seq_num,
+                auth_port: peer.auth_port,
+            };
+
+            match MonadNameRecord::try_from(&peer_entry) {
+                Ok(monad_name_record) => Some((node_id, monad_name_record)),
                 Err(_) => {
                     warn!(?node_id, "invalid name record signature in config file");
                     None
@@ -657,12 +688,18 @@ where
         enable_publisher: node_config.fullnode_raptorcast.enable_publisher,
         enable_client: node_config.fullnode_raptorcast.enable_client,
         rng: ChaCha8Rng::from_entropy(),
+        persisted_peers_path,
     };
+
+    let shared_key = Arc::new(identity);
+    let wireauth_config = monad_wireauth::Config::default();
+    let auth_protocol =
+        monad_raptorcast::auth::WireAuthProtocol::new(wireauth_config, shared_key.clone());
 
     MultiRouter::new(
         self_id,
         RaptorCastConfig {
-            shared_key: Arc::new(identity),
+            shared_key,
             mtu: network_config.mtu,
             udp_message_max_age_ms: network_config.udp_message_max_age_ms,
             primary_instance: RaptorCastConfigPrimary {
@@ -678,6 +715,7 @@ where
         peer_discovery_builder,
         current_epoch,
         epoch_validators,
+        auth_protocol,
     )
 }
 

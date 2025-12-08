@@ -21,8 +21,9 @@ use clap::Parser;
 #[command(name = "monad-rpc", about, long_about = None, version = monad_version::version!())]
 pub struct Cli {
     /// Set the mempool ipc path
+    /// If not set, the tx pool will be disabled.
     #[arg(long)]
-    pub ipc_path: PathBuf,
+    pub ipc_path: Option<PathBuf>,
 
     /// Set the monad triedb path
     #[arg(long)]
@@ -143,6 +144,14 @@ pub struct Cli {
     /// Set the gas limit for eth_estimateGas
     #[arg(long, default_value_t = 30_000_000)]
     pub eth_estimate_gas_provider_gas_limit: u64,
+
+    /// Set the default timeout (in milliseconds) for eth_sendRawTransactionSync
+    #[arg(long, default_value_t = 2_000)]
+    pub eth_send_raw_transaction_sync_default_timeout_ms: u64,
+
+    /// Set the maximum timeout (in milliseconds) for eth_sendRawTransactionSync
+    #[arg(long, default_value_t = 10_000)]
+    pub eth_send_raw_transaction_sync_max_timeout_ms: u64,
 
     /// Enable admin_ethCallStatistics method
     #[arg(long, default_value_t = false)]

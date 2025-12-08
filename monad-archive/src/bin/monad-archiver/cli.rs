@@ -19,7 +19,7 @@ use std::{
     process,
 };
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use eyre::{eyre, Context, Result};
 use monad_archive::cli::{ArchiveArgs, BlockDataReaderArgs};
 use serde::Deserialize;
@@ -55,9 +55,6 @@ pub struct Cli {
     #[serde(default = "default_max_concurrent_blocks")]
     pub max_concurrent_blocks: usize,
 
-    /// Override block number to start at
-    pub start_block: Option<u64>,
-
     /// Override block number to stop at
     pub stop_block: Option<u64>,
 
@@ -67,6 +64,19 @@ pub struct Cli {
     /// DO NOT ENABLE UNDER NORMAL OPERATION
     #[serde(default)]
     pub unsafe_skip_bad_blocks: bool,
+
+    #[serde(default)]
+    /// If set, archiver will require traces to be present for all blocks
+    pub require_traces: bool,
+
+    #[serde(default)]
+    /// If set, archiver will only archive traces
+    pub traces_only: bool,
+
+    #[serde(default)]
+    /// If set, archiver will perform an asynchronous backfill of the archive
+    /// This allows a second archiver to backfill a range while the first archiver is running
+    pub async_backfill: bool,
 
     /// Path to folder containing bft blocks
     /// If set, archiver will upload these files to blob store provided in archive_sink
@@ -112,16 +122,35 @@ pub struct Cli {
     pub skip_connectivity_check: bool,
 }
 
+/// Result of parsing CLI arguments - either a subcommand or daemon config
+pub enum ParsedCli {
+    /// A subcommand was provided - handle and exit
+    Command(Commands),
+    /// No subcommand - run as daemon with this config
+    Daemon(Cli),
+}
+
 impl Cli {
-    pub fn parse() -> Self {
+    pub fn parse() -> ParsedCli {
         Self::try_parse().unwrap_or_else(|err| {
             eprintln!("failed to load monad-archiver configuration: {err:?}");
             process::exit(2);
         })
     }
 
-    pub fn try_parse() -> Result<Self> {
-        CliArgs::parse().into_cli()
+    pub fn try_parse() -> Result<ParsedCli> {
+        let args = CliArgs::parse();
+        // If a subcommand is provided, return it without requiring daemon args
+        if let Some(command) = args.command {
+            return Ok(ParsedCli::Command(command));
+        }
+        // No subcommand - parse full daemon config (this requires block_data_source, archive_sink, etc.)
+        let (_, cli) = CliArgs {
+            command: None,
+            ..args
+        }
+        .into_cli()?;
+        Ok(ParsedCli::Daemon(cli))
     }
 
     fn from_sources(config: Option<Cli>, overrides: CliOverrides) -> Result<Self> {
@@ -141,7 +170,6 @@ impl Cli {
             archive_sink,
             max_blocks_per_iteration,
             max_concurrent_blocks,
-            start_block,
             stop_block,
             unsafe_skip_bad_blocks,
             bft_block_path,
@@ -158,6 +186,9 @@ impl Cli {
             otel_endpoint,
             otel_replica_name_override,
             skip_connectivity_check,
+            require_traces,
+            traces_only,
+            async_backfill,
         } = overrides;
 
         Ok(Self {
@@ -170,7 +201,6 @@ impl Cli {
                 .unwrap_or_else(default_max_blocks_per_iteration),
             max_concurrent_blocks: max_concurrent_blocks
                 .unwrap_or_else(default_max_concurrent_blocks),
-            start_block,
             stop_block,
             unsafe_skip_bad_blocks: unsafe_skip_bad_blocks.unwrap_or(false),
             bft_block_path,
@@ -193,6 +223,9 @@ impl Cli {
             otel_endpoint,
             otel_replica_name_override,
             skip_connectivity_check: skip_connectivity_check.unwrap_or(false),
+            require_traces: require_traces.unwrap_or(false),
+            traces_only: traces_only.unwrap_or(false),
+            async_backfill: async_backfill.unwrap_or(false),
         })
     }
 
@@ -211,9 +244,6 @@ impl Cli {
         }
         if let Some(value) = overrides.max_concurrent_blocks {
             self.max_concurrent_blocks = value;
-        }
-        if let Some(value) = overrides.start_block {
-            self.start_block = Some(value);
         }
         if let Some(value) = overrides.stop_block {
             self.stop_block = Some(value);
@@ -266,9 +296,31 @@ impl Cli {
     }
 }
 
+#[derive(Debug, Subcommand)]
+pub enum Commands {
+    /// Set the start block marker in the archive and exit.
+    /// Use this instead of --start-block to safely configure the starting point.
+    SetStartBlock {
+        /// Block number to set as the latest marker
+        #[arg(long)]
+        block: u64,
+
+        /// Archive sink to write the marker to
+        #[arg(long, value_parser = clap::value_parser!(ArchiveArgs))]
+        archive_sink: ArchiveArgs,
+
+        /// Set the async-backfill marker instead of the primary marker
+        #[arg(long, action = ArgAction::SetTrue)]
+        async_backfill: bool,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "monad-archive", about, long_about = None)]
 struct CliArgs {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     /// Path to a TOML configuration file
     #[arg(long)]
     config: Option<PathBuf>,
@@ -294,10 +346,6 @@ struct CliArgs {
     #[arg(long)]
     max_concurrent_blocks: Option<usize>,
 
-    /// Override block number to start at
-    #[arg(long)]
-    start_block: Option<u64>,
-
     /// Override block number to stop at
     #[arg(long)]
     stop_block: Option<u64>,
@@ -308,6 +356,18 @@ struct CliArgs {
     /// DO NOT ENABLE UNDER NORMAL OPERATION
     #[arg(long, action = ArgAction::SetTrue)]
     unsafe_skip_bad_blocks: bool,
+
+    /// If set, archiver will require traces to be present for all blocks
+    #[arg(long)]
+    require_traces: bool,
+
+    /// If set, archiver will only archive traces
+    #[arg(long, action = ArgAction::SetTrue)]
+    traces_only: bool,
+
+    /// If set, archiver will perform an asynchronous backfill of the archive
+    #[arg(long, action = ArgAction::SetTrue)]
+    async_backfill: bool,
 
     /// Path to folder containing bft blocks
     /// If set, archiver will upload these files to blob store provided in archive_sink
@@ -358,24 +418,24 @@ struct CliArgs {
 }
 
 impl CliArgs {
-    fn into_cli(self) -> Result<Cli> {
-        let (config_path, overrides) = self.into_parts();
+    fn into_cli(self) -> Result<(Option<Commands>, Cli)> {
+        let (command, config_path, overrides) = self.into_parts();
         let config = match config_path {
             Some(path) => Some(load_config(&path)?),
             None => None,
         };
-        Cli::from_sources(config, overrides)
+        Ok((command, Cli::from_sources(config, overrides)?))
     }
 
-    fn into_parts(self) -> (Option<PathBuf>, CliOverrides) {
+    fn into_parts(self) -> (Option<Commands>, Option<PathBuf>, CliOverrides) {
         let Self {
+            command,
             config,
             block_data_source,
             fallback_block_data_source,
             archive_sink,
             max_blocks_per_iteration,
             max_concurrent_blocks,
-            start_block,
             stop_block,
             unsafe_skip_bad_blocks,
             bft_block_path,
@@ -392,6 +452,9 @@ impl CliArgs {
             otel_replica_name_override,
             skip_connectivity_check,
             unsafe_disable_normal_archiving,
+            require_traces,
+            traces_only,
+            async_backfill,
         } = self;
 
         let overrides = CliOverrides {
@@ -400,7 +463,6 @@ impl CliArgs {
             archive_sink,
             max_blocks_per_iteration,
             max_concurrent_blocks,
-            start_block,
             stop_block,
             unsafe_skip_bad_blocks: bool_override(unsafe_skip_bad_blocks),
             bft_block_path,
@@ -417,9 +479,12 @@ impl CliArgs {
             otel_replica_name_override,
             skip_connectivity_check: bool_override(skip_connectivity_check),
             unsafe_disable_normal_archiving: bool_override(unsafe_disable_normal_archiving),
+            require_traces: bool_override(require_traces),
+            traces_only: bool_override(traces_only),
+            async_backfill: bool_override(async_backfill),
         };
 
-        (config, overrides)
+        (command, config, overrides)
     }
 }
 
@@ -430,9 +495,11 @@ struct CliOverrides {
     archive_sink: Option<ArchiveArgs>,
     max_blocks_per_iteration: Option<u64>,
     max_concurrent_blocks: Option<usize>,
-    start_block: Option<u64>,
     stop_block: Option<u64>,
     unsafe_skip_bad_blocks: Option<bool>,
+    require_traces: Option<bool>,
+    traces_only: Option<bool>,
+    async_backfill: Option<bool>,
     bft_block_path: Option<PathBuf>,
     bft_block_poll_freq_secs: Option<u64>,
     bft_block_min_age_secs: Option<u64>,
@@ -505,7 +572,6 @@ mod tests {
         let config = r#"
             max_blocks_per_iteration = 250
             max_concurrent_blocks = 32
-            start_block = 5
             stop_block = 10
             unsafe_skip_bad_blocks = true
             bft_block_path = "/tmp/bft"
@@ -522,6 +588,8 @@ mod tests {
             otel_endpoint = "http://otel"
             otel_replica_name_override = "special"
             skip_connectivity_check = true
+            require_traces = true
+            traces_only = true
 
             [block_data_source]
             type = "aws"
@@ -547,7 +615,6 @@ mod tests {
 
         assert_eq!(cli.max_blocks_per_iteration, 250);
         assert_eq!(cli.max_concurrent_blocks, 32);
-        assert_eq!(cli.start_block, Some(5));
         assert_eq!(cli.stop_block, Some(10));
         assert!(cli.unsafe_skip_bad_blocks);
         assert_eq!(cli.bft_block_path, Some(PathBuf::from("/tmp/bft")));
@@ -564,6 +631,8 @@ mod tests {
         assert_eq!(cli.otel_endpoint.as_deref(), Some("http://otel"));
         assert_eq!(cli.otel_replica_name_override.as_deref(), Some("special"));
         assert!(cli.skip_connectivity_check);
+        assert!(cli.require_traces);
+        assert!(cli.traces_only);
 
         match &cli.block_data_source {
             BlockDataReaderArgs::Aws(args) => {
@@ -661,7 +730,7 @@ mod tests {
         )
         .unwrap();
 
-        let cli =
+        let (_, cli) =
             CliArgs::parse_from(["monad-archiver", "--config", file.path().to_str().unwrap()])
                 .into_cli()
                 .expect("config file should load");
@@ -702,7 +771,7 @@ mod tests {
         )
         .unwrap();
 
-        let cli = CliArgs::parse_from([
+        let (_, cli) = CliArgs::parse_from([
             "monad-archiver",
             "--config",
             file.path().to_str().unwrap(),

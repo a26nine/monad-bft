@@ -23,10 +23,14 @@ pub mod blockstream;
 pub mod ecmul;
 pub mod eip7702;
 pub mod erc20;
+pub mod erc4337_entrypoint;
 pub mod eth_json_rpc;
 pub mod key_pool;
+pub mod nft_sale;
 pub mod private_key;
+pub mod simple7702_account;
 pub mod uniswap;
+pub mod weth;
 
 async fn ensure_contract_deployed(
     client: &ReqwestClient,
@@ -43,6 +47,16 @@ async fn ensure_contract_deployed(
 
         if let Ok(receipt) = client.get_transaction_receipt(hash).await {
             info!(receipt = ?receipt, "Contract deployment receipt");
+
+            // Check if transaction succeeded
+            if !receipt.status() {
+                return Err(eyre::eyre!(
+                    "Contract deployment transaction failed! Gas used: {}, Hash: {}",
+                    receipt.gas_used,
+                    hash
+                ));
+            }
+
             return Ok(());
         }
 

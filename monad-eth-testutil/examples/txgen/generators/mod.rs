@@ -13,18 +13,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use duplicates::DuplicateTxGenerator;
 use ecmul::ECMulGenerator;
 use eip7702::EIP7702Generator;
 use eip7702_create::EIP7702CreateGenerator;
+use erc4337_7702_bundled::ERC4337_7702BundledGenerator;
 use extreme_values::ExtremeValuesGenerator;
 use few_to_many::CreateAccountsGenerator;
 use high_call_data::HighCallDataTxGenerator;
 use many_to_many::ManyToManyGenerator;
+use nft_sale::NftSaleGenerator;
 use non_deterministic_storage::NonDeterministicStorageTxGenerator;
-use rand::prelude::*;
 use reserve_balance::ReserveBalanceGenerator;
 use reserve_balance_fail::ReserveBalanceFailGenerator;
 use self_destruct::SelfDestructTxGenerator;
@@ -43,10 +46,12 @@ mod duplicates;
 mod ecmul;
 mod eip7702;
 mod eip7702_create;
+mod erc4337_7702_bundled;
 mod extreme_values;
 mod few_to_many;
 mod high_call_data;
 mod many_to_many;
+mod nft_sale;
 mod non_deterministic_storage;
 mod reserve_balance;
 mod reserve_balance_fail;
@@ -62,48 +67,64 @@ pub fn make_generator(
 ) -> Result<Box<dyn Generator + Send + Sync>> {
     let recipient_keys = KeyPool::new(traffic_gen.recipients, traffic_gen.recipient_seed);
     let tx_per_sender = traffic_gen.tx_per_sender();
+
+    let gen_tx_type = |tx_type: TxType, contract_count: usize| -> Result<GenTxType> {
+        match tx_type {
+            TxType::Native => Ok(GenTxType::Native),
+            TxType::ERC20 => Ok(GenTxType::ERC20(ERC20Pool::from_deployed_contract(
+                deployed_contract.clone(),
+                contract_count,
+            )?)),
+        }
+    };
+
     Ok(match &traffic_gen.gen_mode {
         GenMode::NullGen => Box::new(NullGen),
         GenMode::FewToMany(config) => Box::new(CreateAccountsGenerator {
             recipient_keys,
-            tx_type: config.tx_type,
-            erc20: deployed_contract.erc20().ok(),
+            tx_type: gen_tx_type(config.tx_type, config.contract_count)?,
             tx_per_sender,
         }),
         GenMode::ManyToMany(config) => Box::new(ManyToManyGenerator {
             recipient_keys,
-            tx_type: config.tx_type,
             tx_per_sender,
-            erc20: deployed_contract.erc20().ok(),
+            tx_type: gen_tx_type(config.tx_type, config.contract_count)?,
         }),
         GenMode::Duplicates => Box::new(DuplicateTxGenerator {
             recipient_keys,
             tx_per_sender,
             random_priority_fee: false,
-            tx_type: TxType::Native,
-            erc20: None,
+            tx_type: GenTxType::Native,
         }),
         GenMode::RandomPriorityFee(config) => Box::new(DuplicateTxGenerator {
             recipient_keys,
             tx_per_sender,
             random_priority_fee: true,
-            tx_type: config.tx_type,
-            erc20: deployed_contract.erc20().ok(),
+            tx_type: gen_tx_type(config.tx_type, config.contract_count)?,
         }),
-        GenMode::HighCallData => Box::new(HighCallDataTxGenerator {
+        GenMode::HighCallData(config) => Box::new(HighCallDataTxGenerator {
             recipient_keys,
             tx_per_sender,
-            erc20: deployed_contract.erc20().ok(),
+            erc20_pool: ERC20Pool::from_deployed_contract(
+                deployed_contract,
+                config.contract_count,
+            )?,
         }),
-        GenMode::NonDeterministicStorage => Box::new(NonDeterministicStorageTxGenerator {
+        GenMode::NonDeterministicStorage(config) => Box::new(NonDeterministicStorageTxGenerator {
             recipient_keys,
             tx_per_sender,
-            erc20: deployed_contract.erc20()?,
+            erc20_pool: ERC20Pool::from_deployed_contract(
+                deployed_contract,
+                config.contract_count,
+            )?,
         }),
-        GenMode::StorageDeletes => Box::new(StorageDeletesTxGenerator {
+        GenMode::StorageDeletes(config) => Box::new(StorageDeletesTxGenerator {
             recipient_keys,
             tx_per_sender,
-            erc20: deployed_contract.erc20()?,
+            erc20_pool: ERC20Pool::from_deployed_contract(
+                deployed_contract,
+                config.contract_count,
+            )?,
         }),
         GenMode::SelfDestructs => Box::new(SelfDestructTxGenerator {
             tx_per_sender,
@@ -154,12 +175,81 @@ pub fn make_generator(
             tx_per_sender,
             config.authorizations_per_tx,
         )),
-        GenMode::ExtremeValues => Box::new(ExtremeValuesGenerator::new(
+        GenMode::ExtremeValues(config) => Box::new(ExtremeValuesGenerator::new(
             recipient_keys,
             tx_per_sender,
-            deployed_contract.erc20()?,
+            ERC20Pool::from_deployed_contract(deployed_contract, config.contract_count)?,
         )),
+        GenMode::NftSale => Box::new(NftSaleGenerator {
+            nft_sale: deployed_contract.nft_sale()?,
+            tx_per_sender,
+        }),
+        GenMode::ERC4337_7702Bundled(config) => {
+            let erc4337_7702 = deployed_contract.erc4337_7702()?;
+
+            Box::new(ERC4337_7702BundledGenerator::new(
+                erc4337_7702.entrypoint,
+                erc4337_7702.simple7702account,
+                config.ops_per_bundle,
+                tx_per_sender,
+                None,
+                recipient_keys,
+            ))
+        }
     })
+}
+
+pub enum GenTxType {
+    Native,
+    ERC20(ERC20Pool),
+}
+
+pub struct ERC20Pool {
+    pool: Vec<ERC20>,
+    index: AtomicUsize,
+}
+
+impl ERC20Pool {
+    pub fn new(erc20s: Vec<ERC20>) -> Result<Self> {
+        if erc20s.is_empty() {
+            return Err(eyre::eyre!("ERC20 pool is empty"));
+        }
+        Ok(Self {
+            pool: erc20s,
+            index: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn from_deployed_contract(
+        deployed_contract: DeployedContract,
+        contract_count: usize,
+    ) -> Result<Self> {
+        let mut erc20s = deployed_contract.erc20()?;
+        if erc20s.len() < contract_count {
+            return Err(eyre::eyre!(
+                "Not enough ERC20 contracts deployed: {} < {}",
+                erc20s.len(),
+                contract_count
+            ));
+        }
+        erc20s.resize(
+            contract_count,
+            ERC20 {
+                addr: Address::ZERO,
+            },
+        );
+        Self::new(erc20s)
+    }
+}
+
+impl ERC20Pool {
+    pub fn next_contract(&self) -> &ERC20 {
+        let index = self.index.load(Ordering::Acquire);
+        let erc20 = self.pool.get(index).expect("ERC20 pool is empty");
+        self.index
+            .store((index + 1) % self.pool.len(), Ordering::Release);
+        erc20
+    }
 }
 
 struct NullGen;
@@ -273,7 +363,9 @@ pub fn erc20_transfer(
         .native_bal
         .checked_sub(U256::from(400_000 * max_fee_per_gas))
         .unwrap_or(U256::ZERO); // todo: wire gas correctly, see above comment
-    from.erc20_bal = from.erc20_bal.checked_sub(amt).unwrap_or(U256::ZERO);
+
+    let balance = from.erc20_balances.entry(erc20.addr).or_insert(U256::ZERO);
+    *balance = balance.checked_sub(amt).unwrap_or(U256::ZERO);
     tx
 }
 
@@ -295,77 +387,9 @@ pub fn erc20_mint(from: &mut SimpleAccount, erc20: &ERC20, ctx: &GenCtx) -> TxEn
         .native_bal
         .checked_sub(U256::from(400_000 * max_fee_per_gas))
         .unwrap_or(U256::ZERO); // todo: wire gas correctly, see above comment
-    from.erc20_bal += U256::from(10_u128.pow(30)); // todo: current erc20 impl just mints a constant
+
+    let mint_amount = U256::from(10_u128.pow(30)); // todo: current erc20 impl just mints a constant
+    let balance = from.erc20_balances.entry(erc20.addr).or_insert(U256::ZERO);
+    *balance += mint_amount;
     tx
-}
-
-pub fn mutate_eip1559_transaction(
-    tx: &TxEnvelope,
-    original_key: &crate::shared::private_key::PrivateKey,
-) -> TxEnvelope {
-    let mut rng = rand::thread_rng();
-
-    let TxEnvelope::Eip1559(signed_tx) = tx else {
-        error!("mutate_eip1559_transaction called with non-EIP1559 transaction");
-        return tx.clone();
-    };
-
-    let original_tx = &signed_tx.tx();
-
-    let mut new_tx = TxEip1559 {
-        chain_id: original_tx.chain_id,
-        nonce: original_tx.nonce,
-        gas_limit: original_tx.gas_limit,
-        max_fee_per_gas: original_tx.max_fee_per_gas,
-        max_priority_fee_per_gas: original_tx.max_priority_fee_per_gas,
-        to: original_tx.to,
-        value: original_tx.value,
-        access_list: original_tx.access_list.clone(),
-        input: original_tx.input.clone(),
-    };
-
-    // 8 fields total: 7 transaction fields + 1 signature field
-    const FIELD_MUTATION_PROB: f64 = 1.0 / 8.0;
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        new_tx.nonce = rng.gen_range(0..=u64::MAX);
-    }
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        new_tx.gas_limit = rng.gen_range(0..=u64::MAX);
-    }
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        new_tx.max_fee_per_gas = rng.gen_range(0..=u128::MAX);
-    }
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        new_tx.max_priority_fee_per_gas = rng.gen_range(0..=u128::MAX);
-    }
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        new_tx.to = TxKind::Call(Address::from(rng.gen::<[u8; 20]>()));
-    }
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        new_tx.value = U256::from(rng.gen::<u128>());
-    }
-
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        let input_len = rng.gen_range(0..=1000);
-        new_tx.input = Bytes::from((0..input_len).map(|_| rng.gen::<u8>()).collect::<Vec<_>>());
-    }
-
-    // Mutate signature (sign with wrong key) if selected
-    if rng.gen_bool(FIELD_MUTATION_PROB) {
-        // Mutate signature by signing with a random key (invalid signature)
-        let (_random_addr, random_key) =
-            crate::shared::private_key::PrivateKey::new_with_random(&mut rng);
-        let sig = random_key.sign_transaction(&new_tx);
-        TxEnvelope::Eip1559(new_tx.into_signed(sig))
-    } else {
-        // Sign with original key (valid signature, but mutated fields)
-        let sig = original_key.sign_transaction(&new_tx);
-        TxEnvelope::Eip1559(new_tx.into_signed(sig))
-    }
 }

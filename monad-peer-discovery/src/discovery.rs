@@ -16,6 +16,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::SocketAddrV4,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -24,15 +25,17 @@ use monad_crypto::certificate_signature::{
 };
 use monad_executor::ExecutorMetrics;
 use monad_executor_glue::PeerEntry;
+use monad_node_config::{NodeBootstrapConfig, NodeBootstrapPeerConfig};
 use monad_types::{Epoch, NodeId, Round};
 use rand::{RngCore, seq::IteratorRandom};
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    MonadNameRecord, NameRecord, PeerDiscoveryAlgo, PeerDiscoveryAlgoBuilder, PeerDiscoveryCommand,
-    PeerDiscoveryEvent, PeerDiscoveryMessage, PeerDiscoveryMetricsCommand,
-    PeerDiscoveryTimerCommand, PeerLookupRequest, PeerLookupResponse, Ping, Pong, TimerKind,
+    MonadNameRecord, MonadNameRecordWithPubkey, NameRecord, PeerDiscoveryAlgo,
+    PeerDiscoveryAlgoBuilder, PeerDiscoveryCommand, PeerDiscoveryEvent, PeerDiscoveryMessage,
+    PeerDiscoveryMetricsCommand, PeerDiscoveryTimerCommand, PeerLookupRequest, PeerLookupResponse,
+    Ping, Pong, TimerKind,
     ipv4_validation::{IpCheckError, validate_socket_ipv4_address},
 };
 
@@ -165,6 +168,7 @@ pub struct PeerDiscovery<ST: CertificateSignatureRecoverable> {
     // secondary raptorcast setting: enable client mode when self is a full node
     pub enable_client: bool,
     pub rng: ChaCha8Rng,
+    pub persisted_peers_path: PathBuf,
 }
 
 pub struct PeerDiscoveryBuilder<ST: CertificateSignatureRecoverable> {
@@ -186,6 +190,7 @@ pub struct PeerDiscoveryBuilder<ST: CertificateSignatureRecoverable> {
     pub enable_publisher: bool,
     pub enable_client: bool,
     pub rng: ChaCha8Rng,
+    pub persisted_peers_path: PathBuf,
 }
 
 impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDiscoveryBuilder<ST> {
@@ -258,6 +263,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDisco
             enable_publisher: self.enable_publisher,
             enable_client: self.enable_client,
             rng: self.rng,
+            persisted_peers_path: self.persisted_peers_path,
         };
 
         let mut cmds = Vec::new();
@@ -268,6 +274,8 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDisco
                     cmds.extend(cmds_from_insert);
                 }
             });
+
+        cmds.extend(state.read_peers_from_file());
 
         cmds.extend(state.refresh());
 
@@ -424,7 +432,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
         self.metrics[GAUGE_PEER_DISC_NUM_PENDING_PEERS] = self.pending_queue.len() as u64;
 
         // send ping to the peer, which will also insert the peer into pending queue
-        Ok(self.send_ping(peer_id, name_record.udp_address(), ping_msg))
+        Ok(self.send_ping(peer_id, name_record.name_record, ping_msg))
     }
 
     fn remove_peer_from_pending(
@@ -492,6 +500,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
 
         // full node will try to connect to NUM_UPSTREAM_VALIDATORS
         // if insufficient connected upstream validators, try to send pings to new validators
+        // validators that are currently in pending status are also counted so that full nodes do not try to connect to excessive validators
         let connected_validators = self
             .participation_info
             .iter()
@@ -608,6 +617,85 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
     fn is_pinned_node(&self, peer_id: &NodeId<CertificateSignaturePubKey<ST>>) -> bool {
         self.check_validator_membership(peer_id) || self.pinned_full_nodes.contains(peer_id)
     }
+
+    fn write_peers_to_file(&self) {
+        // store name records of all peers in routing_info and pending_queue
+        let mut peer_configs: Vec<NodeBootstrapPeerConfig<ST>> = self
+            .routing_info
+            .iter()
+            .map(|(peer_id, name_record)| {
+                MonadNameRecordWithPubkey {
+                    pubkey: peer_id.pubkey(),
+                    record: name_record,
+                }
+                .into()
+            })
+            .collect();
+        for (peer_id, conn_info) in self.pending_queue.iter() {
+            peer_configs.push(
+                MonadNameRecordWithPubkey {
+                    pubkey: peer_id.pubkey(),
+                    record: &conn_info.name_record,
+                }
+                .into(),
+            );
+        }
+
+        let bootstrap_config = NodeBootstrapConfig {
+            peers: peer_configs,
+        };
+
+        match toml::to_string(&bootstrap_config) {
+            Ok(serialized) => {
+                if let Err(error) = std::fs::write(&self.persisted_peers_path, serialized) {
+                    warn!(?error, "failed to write name records to file");
+                }
+            }
+            Err(error) => {
+                warn!(?error, "failed to serialize peers");
+            }
+        }
+    }
+
+    fn read_peers_from_file(&mut self) -> Vec<PeerDiscoveryCommand<ST>> {
+        let mut cmds = Vec::new();
+
+        // read peers.toml if it exists
+        let contents = match std::fs::read_to_string(&self.persisted_peers_path) {
+            Ok(c) => c,
+            Err(err) => {
+                debug!(?err, "no peers toml file found, skipping");
+                return cmds;
+            }
+        };
+
+        let peer_config = match toml::from_str::<NodeBootstrapConfig<ST>>(&contents) {
+            Ok(config) => config,
+            Err(err) => {
+                debug!(?err, "failed to parse peers toml file, skipping");
+                return cmds;
+            }
+        };
+
+        debug!(path =? self.persisted_peers_path, loaded_len = peer_config.peers.len(), "loaded persisted peers");
+
+        // process each peer and insert into pending queue
+        for peer in peer_config.peers {
+            let node_id = NodeId::new(peer.secp256k1_pubkey);
+            match (&peer).try_into() {
+                Ok(name_record) => match self.insert_peer_to_pending(node_id, name_record) {
+                    Ok(cmds_from_insert) => cmds.extend(cmds_from_insert),
+                    Err(_) => continue,
+                },
+                Err(e) => {
+                    warn!(?e, ?node_id, "invalid persisted peer config, skipping");
+                    continue;
+                }
+            };
+        }
+
+        cmds
+    }
 }
 
 impl<ST> PeerDiscoveryAlgo for PeerDiscovery<ST>
@@ -619,7 +707,7 @@ where
     fn send_ping(
         &mut self,
         to: NodeId<CertificateSignaturePubKey<ST>>,
-        socket_address: SocketAddrV4,
+        name_record: NameRecord,
         ping: Ping<ST>,
     ) -> Vec<PeerDiscoveryCommand<ST>> {
         debug!(?to, "sending ping request");
@@ -630,7 +718,7 @@ where
 
         cmds.push(PeerDiscoveryCommand::PingPongCommand {
             target: to,
-            socket_address,
+            name_record,
             message: PeerDiscoveryMessage::Ping(ping),
         });
 
@@ -711,7 +799,7 @@ where
         };
         cmds.push(PeerDiscoveryCommand::PingPongCommand {
             target: from,
-            socket_address: ping_msg.local_name_record.udp_address(),
+            name_record: ping_msg.local_name_record.name_record,
             message: PeerDiscoveryMessage::Pong(pong_msg),
         });
         self.metrics[GAUGE_PEER_DISC_SEND_PONG] += 1;
@@ -780,13 +868,13 @@ where
                 cmds.extend(self.remove_peer_from_pending(to));
             } else {
                 // retry ping
-                let socket_address = info.name_record.udp_address();
+                let name_record = info.name_record.name_record.clone();
                 let ping = Ping {
                     id: self.rng.next_u32(),
                     local_name_record: self.self_record.clone(),
                 };
                 info.last_ping = ping.clone();
-                cmds.extend(self.send_ping(to, socket_address, ping));
+                cmds.extend(self.send_ping(to, name_record, ping));
             }
         }
 
@@ -1273,6 +1361,23 @@ where
             }
         }
 
+        // for full nodes, do an open discovery every refresh period to discover any validator name records update
+        if self.self_role == PeerDiscoveryRole::FullNodeNone
+            || self.self_role == PeerDiscoveryRole::FullNodeClient
+        {
+            if let Some(validators) = self.epoch_validators.get(&self.current_epoch) {
+                if let Some(peer) = chosen_peers.last() {
+                    if let Some(random_validator) = validators.iter().choose(&mut self.rng) {
+                        trace!(
+                            ?random_validator,
+                            "full node sending open discovery to random validator"
+                        );
+                        cmds.extend(self.send_peer_lookup_request(*peer, *random_validator, true));
+                    }
+                }
+            }
+        }
+
         // if self is a full node, try to connect to a few current validators if not already connected
         // collect metrics
         if self.self_role == PeerDiscoveryRole::FullNodeClient {
@@ -1290,6 +1395,8 @@ where
 
         self.metrics[GAUGE_PEER_DISC_NUM_PEERS] = self.routing_info.len() as u64;
         self.metrics[GAUGE_PEER_DISC_NUM_PENDING_PEERS] = self.pending_queue.len() as u64;
+
+        self.write_peers_to_file();
 
         // reset timer to schedule for the next refresh
         cmds.extend(self.reset_refresh_timer());
@@ -1412,30 +1519,18 @@ where
         debug!(?peers, "updating peers");
 
         let mut cmds = Vec::new();
-
         for peer in peers {
             let node_id = NodeId::new(peer.pubkey);
-
-            // verify signature of name record
-            let name_record = MonadNameRecord {
-                name_record: NameRecord::new(
-                    *peer.addr.ip(),
-                    peer.addr.port(),
-                    peer.record_seq_num,
-                ),
-                signature: peer.signature,
-            };
-            let verified = name_record
-                .recover_pubkey()
-                .is_ok_and(|recovered_node_id| recovered_node_id == node_id);
-            if verified {
-                match self.insert_peer_to_pending(node_id, name_record) {
+            match (&peer).try_into() {
+                Ok(name_record) => match self.insert_peer_to_pending(node_id, name_record) {
                     Ok(cmds_from_insert) => cmds.extend(cmds_from_insert),
                     Err(_) => continue,
+                },
+                Err(e) => {
+                    warn!(?e, ?node_id, "invalid name record, dropping record...");
+                    continue;
                 }
-            } else {
-                warn!(?node_id, "invalid name record signature");
-            }
+            };
         }
 
         cmds
@@ -1538,11 +1633,21 @@ where
             .map(|(id, name_record)| (*id, name_record.clone()))
             .collect()
     }
+
+    fn get_name_record(
+        &self,
+        id: &NodeId<CertificateSignaturePubKey<ST>>,
+    ) -> Option<&MonadNameRecord<ST>> {
+        self.routing_info.get(id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        time::Duration,
+    };
 
     use alloy_rlp::Encodable;
     use monad_crypto::{
@@ -1625,6 +1730,7 @@ mod tests {
             enable_publisher: false,
             enable_client: false,
             rng: ChaCha8Rng::seed_from_u64(123456),
+            persisted_peers_path: Default::default(),
         }
     }
 
@@ -1666,7 +1772,7 @@ mod tests {
             .filter_map(|c| match c {
                 PeerDiscoveryCommand::PingPongCommand {
                     target,
-                    socket_address: _,
+                    name_record: _,
                     message: PeerDiscoveryMessage::Ping(ping),
                 } => Some((target, ping)),
                 _ => None,
@@ -1679,7 +1785,7 @@ mod tests {
             .filter_map(|c| match c {
                 PeerDiscoveryCommand::PingPongCommand {
                     target: _,
-                    socket_address: _,
+                    name_record: _,
                     message: PeerDiscoveryMessage::Pong(pong),
                 } => Some(pong),
                 _ => None,
@@ -1701,7 +1807,8 @@ mod tests {
             id: 12345,
             local_name_record: state.self_record.clone(),
         };
-        let cmds = state.send_ping(peer1_pubkey, DUMMY_ADDR, ping);
+        let peer1_name_record = generate_name_record(peer1, 1).name_record;
+        let cmds = state.send_ping(peer1_pubkey, peer1_name_record, ping);
 
         // should send a ping command and schedule a ping timeout
         assert_eq!(cmds.len(), 2);
@@ -1714,7 +1821,7 @@ mod tests {
         ));
         assert!(matches!(cmds[1], PeerDiscoveryCommand::PingPongCommand {
             target: _,
-            socket_address: _,
+            name_record: _,
             message: PeerDiscoveryMessage::Ping(_)
         }));
     }
@@ -2136,7 +2243,7 @@ mod tests {
         // should send peer lookup request to peer1
         let cmds = state.refresh();
         let lookup_requests = extract_lookup_requests(cmds);
-        assert_eq!(lookup_requests.len(), 1);
+        assert_eq!(lookup_requests.len(), 2);
         let receiver = state
             .outstanding_lookup_requests
             .get(&lookup_requests[0].lookup_id)
@@ -2382,7 +2489,7 @@ mod tests {
         // do not look for upstream validator if running as None in secondary raptorcast
         state.self_role = PeerDiscoveryRole::FullNodeNone;
         let cmds = state.refresh();
-        assert_eq!(cmds.len(), 3); // 2 timer commands and 1 metrics command
+        assert_eq!(cmds.len(), 5); // 2 peer look commands (unrelated to test case), 2 timer commands and 1 metrics command
 
         // look for upstream validator if running as a Client in secondary raptorcast
         state.self_role = PeerDiscoveryRole::FullNodeClient;
@@ -2448,5 +2555,168 @@ mod tests {
         state.self_role = PeerDiscoveryRole::ValidatorNone;
         let selected_peers = state.select_peers_to_lookup_from();
         assert_eq!(selected_peers.len(), 3);
+    }
+
+    #[test]
+    fn test_persist_peers() {
+        // use SecpSignature instead of NopSignature to avoid TOML serialization errors
+        use monad_secp::SecpSignature;
+        use monad_testutil::signing::create_keys as create_secp_keys;
+
+        let keys = create_secp_keys::<SecpSignature>(3);
+        let peer0 = &keys[0];
+        let peer1 = &keys[1];
+        let peer1_pubkey = NodeId::new(peer1.pubkey());
+        let peer2 = &keys[2];
+        let peer2_pubkey = NodeId::new(peer2.pubkey());
+
+        // peer1 has no authenticated UDP port
+        let peer1_name_record = {
+            let name_record = NameRecord::new(Ipv4Addr::new(8, 8, 8, 8), 8000, 1);
+            let mut encoded = Vec::new();
+            name_record.encode(&mut encoded);
+            let signature = SecpSignature::sign::<signing_domain::NameRecord>(&encoded, peer1);
+            MonadNameRecord {
+                name_record,
+                signature,
+            }
+        };
+
+        // peer2 has authenticated UDP port
+        let peer2_name_record = {
+            let name_record =
+                NameRecord::new_with_authentication(Ipv4Addr::new(8, 8, 4, 4), 8001, 8001, 9001, 2);
+            let mut encoded = Vec::new();
+            name_record.encode(&mut encoded);
+            let signature = SecpSignature::sign::<signing_domain::NameRecord>(&encoded, peer2);
+            MonadNameRecord {
+                name_record,
+                signature,
+            }
+        };
+
+        // initial state: peer1 in routing_info and peer2 in pending_queue
+        let mut routing_info = BTreeMap::new();
+        routing_info.insert(peer1_pubkey, peer1_name_record);
+        let mut pending_queue = BTreeMap::new();
+        pending_queue.insert(peer2_pubkey, ConnectionInfo {
+            last_ping: Ping {
+                id: 0,
+                local_name_record: peer2_name_record.clone(),
+            },
+            unresponsive_pings: 0,
+            name_record: peer2_name_record,
+        });
+
+        let mut state = PeerDiscovery {
+            self_id: NodeId::new(peer0.pubkey()),
+            self_record: {
+                let name_record = NameRecord::new(*DUMMY_ADDR.ip(), DUMMY_ADDR.port(), 0);
+                let mut encoded = Vec::new();
+                name_record.encode(&mut encoded);
+                let signature = SecpSignature::sign::<signing_domain::NameRecord>(&encoded, peer0);
+                MonadNameRecord {
+                    name_record,
+                    signature,
+                }
+            },
+            self_role: PeerDiscoveryRole::FullNodeNone,
+            current_round: Round(1),
+            current_epoch: Epoch(1),
+            epoch_validators: BTreeMap::new(),
+            initial_bootstrap_peers: routing_info.keys().cloned().collect(),
+            pinned_full_nodes: BTreeSet::new(),
+            prioritized_full_nodes: BTreeSet::new(),
+            routing_info,
+            participation_info: BTreeMap::new(),
+            pending_queue,
+            outstanding_lookup_requests: HashMap::new(),
+            metrics: ExecutorMetrics::default(),
+            refresh_period: Duration::from_secs(120),
+            request_timeout: Duration::from_secs(5),
+            unresponsive_prune_threshold: 10,
+            last_participation_prune_threshold: Round(5000),
+            min_num_peers: 5,
+            max_num_peers: 50,
+            max_group_size: 50,
+            enable_publisher: false,
+            enable_client: false,
+            rng: ChaCha8Rng::seed_from_u64(123456),
+            persisted_peers_path: Default::default(),
+        };
+
+        // set up a temporary file path for testing
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_persisted_peers_{}.toml", std::process::id()));
+        state.persisted_peers_path = temp_file.clone();
+
+        // clean up any existing file
+        let _ = std::fs::remove_file(&temp_file);
+
+        // verify initial state has peer1 in routing_info and peer2 in pending_queue
+        assert!(state.routing_info.contains_key(&peer1_pubkey));
+        assert!(!state.routing_info.contains_key(&peer2_pubkey));
+        assert!(state.pending_queue.contains_key(&peer2_pubkey));
+        assert!(!state.pending_queue.contains_key(&peer1_pubkey));
+
+        // write peers to file
+        state.write_peers_to_file();
+
+        assert!(
+            temp_file.exists(),
+            "persisted file was not created at {:?}",
+            temp_file
+        );
+
+        // read from the written file and verify content matches expected snapshot format
+        let written_content =
+            std::fs::read_to_string(&temp_file).expect("Failed to read persisted peers file");
+        insta::assert_snapshot!("persisted_peers_format", written_content);
+
+        // artificially clear routing_info and pending_queue
+        state.routing_info.clear();
+        state.pending_queue.clear();
+        assert!(state.routing_info.is_empty());
+        assert!(state.pending_queue.is_empty());
+
+        state.read_peers_from_file();
+
+        // verify that peer1 and peer2 are restored from file and now in pending_queue
+        assert!(state.pending_queue.contains_key(&peer1_pubkey));
+        assert!(state.pending_queue.contains_key(&peer2_pubkey));
+        assert!(
+            state.routing_info.is_empty(),
+            "routing_info should still be empty before ping pong"
+        );
+
+        // verify peer1 data (no auth port)
+        let loaded_peer1 = &state.pending_queue.get(&peer1_pubkey).unwrap().name_record;
+        assert_eq!(
+            loaded_peer1.udp_address(),
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 8000),
+            "peer1 address should match"
+        );
+        assert_eq!(loaded_peer1.seq(), 1, "peer1 seq should match");
+        assert_eq!(
+            loaded_peer1.name_record.authenticated_udp_port(),
+            None,
+            "peer1 should not have auth port"
+        );
+
+        // verify peer2 data (with auth port)
+        let loaded_peer2 = &state.pending_queue.get(&peer2_pubkey).unwrap().name_record;
+        assert_eq!(
+            loaded_peer2.udp_address(),
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 8001),
+            "peer2 address should match"
+        );
+        assert_eq!(loaded_peer2.seq(), 2, "peer2 seq should match");
+        assert_eq!(
+            loaded_peer2.name_record.authenticated_udp_port(),
+            Some(9001),
+            "peer2 auth port should match"
+        );
+
+        let _ = std::fs::remove_file(&temp_file);
     }
 }

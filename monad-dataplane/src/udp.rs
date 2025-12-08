@@ -32,12 +32,6 @@ use tracing::{debug, error, trace, warn};
 use super::{RecvUdpMsg, UdpMsg};
 use crate::buffer_ext::SocketBufferExt;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum UdpMessageType {
-    Broadcast,
-    Direct,
-}
-
 const PRIORITY_QUEUE_BYTES_CAPACITY: usize = 100 * 1024 * 1024;
 
 #[derive(Error, Debug)]
@@ -98,7 +92,7 @@ impl PriorityQueues {
     }
 }
 
-pub const DEFAULT_MTU: u16 = ETHERNET_MTU;
+pub const DEFAULT_MTU: u16 = monad_types::DEFAULT_MTU;
 
 const IPV4_HDR_SIZE: u16 = 20;
 const UDP_HDR_SIZE: u16 = 8;
@@ -107,9 +101,7 @@ pub const fn segment_size_for_mtu(mtu: u16) -> u16 {
 }
 
 pub const DEFAULT_SEGMENT_SIZE: u16 = segment_size_for_mtu(DEFAULT_MTU);
-
-const ETHERNET_MTU: u16 = 1500;
-pub const ETHERNET_SEGMENT_SIZE: u16 = segment_size_for_mtu(ETHERNET_MTU);
+pub const ETHERNET_SEGMENT_SIZE: u16 = segment_size_for_mtu(monad_types::ETHERNET_MTU);
 
 fn configure_socket(socket: &UdpSocket, buffer_size: Option<usize>) {
     if let Some(size) = buffer_size {
@@ -165,36 +157,21 @@ fn set_mtu_discovery(socket: &UdpSocket) {
 }
 
 pub(crate) fn spawn_tasks(
-    local_addr: SocketAddr,
-    direct_socket_port: Option<u16>,
-    udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
-    udp_direct_ingress_tx: mpsc::Sender<RecvUdpMsg>,
+    socket_configs: Vec<(usize, SocketAddr, String, mpsc::Sender<RecvUdpMsg>)>,
     udp_egress_rx: mpsc::Receiver<UdpMsg>,
     up_bandwidth_mbps: u64,
     buffer_size: Option<usize>,
 ) {
-    let (udp_socket_rx, udp_socket_tx) = create_socket_pair(local_addr, buffer_size);
-    let (direct_socket_rx, direct_socket_tx) = direct_socket_port
-        .map(|port| {
-            let mut direct_addr = local_addr;
-            direct_addr.set_port(port);
-            let (rx, tx) = create_socket_pair(direct_addr, buffer_size);
-            (Some(rx), Some(tx))
-        })
-        .unwrap_or((None, None));
+    let mut tx_sockets = Vec::new();
 
-    spawn(rx(
-        udp_socket_rx,
-        direct_socket_rx,
-        udp_ingress_tx,
-        udp_direct_ingress_tx,
-    ));
-    spawn(tx(
-        udp_socket_tx,
-        direct_socket_tx,
-        udp_egress_rx,
-        up_bandwidth_mbps,
-    ));
+    for (socket_id, socket_addr, label, ingress_tx) in socket_configs {
+        let (rx, tx) = create_socket_pair(socket_addr, buffer_size);
+        spawn(rx_single_socket(rx, ingress_tx));
+        trace!(socket_id, label = %label, ?socket_addr, "created socket");
+        tx_sockets.push(tx);
+    }
+
+    spawn(tx(tx_sockets, udp_egress_rx, up_bandwidth_mbps));
 }
 
 fn create_socket_pair(addr: SocketAddr, buffer_size: Option<usize>) -> (UdpSocket, UdpSocket) {
@@ -203,23 +180,6 @@ fn create_socket_pair(addr: SocketAddr, buffer_size: Option<usize>) -> (UdpSocke
     let tx =
         UdpSocket::from_std(unsafe { std::net::UdpSocket::from_raw_fd(rx.as_raw_fd()) }).unwrap();
     (rx, tx)
-}
-
-async fn rx(
-    udp_socket_rx: UdpSocket,
-    direct_socket_rx: Option<UdpSocket>,
-    udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
-    udp_direct_ingress_tx: mpsc::Sender<RecvUdpMsg>,
-) {
-    match direct_socket_rx {
-        Some(direct_socket) => {
-            spawn(rx_single_socket(udp_socket_rx, udp_ingress_tx));
-            spawn(rx_single_socket(direct_socket, udp_direct_ingress_tx));
-        }
-        None => {
-            rx_single_socket(udp_socket_rx, udp_ingress_tx).await;
-        }
-    }
 }
 
 async fn rx_single_socket(socket: UdpSocket, udp_ingress_tx: mpsc::Sender<RecvUdpMsg>) {
@@ -251,8 +211,7 @@ async fn rx_single_socket(socket: UdpSocket, udp_ingress_tx: mpsc::Sender<RecvUd
 const PACING_SLEEP_OVERSHOOT_DETECTION_WINDOW: Duration = Duration::from_millis(100);
 
 async fn tx(
-    socket_tx: UdpSocket,
-    direct_socket_tx: Option<UdpSocket>,
+    tx_sockets: Vec<UdpSocket>,
     mut udp_egress_rx: mpsc::Receiver<UdpMsg>,
     up_bandwidth_mbps: u64,
 ) {
@@ -312,13 +271,10 @@ async fn tx(
             let chunk = msg.payload.split_to(chunk_size);
             total_bytes += chunk.len();
 
-            let socket = match (&msg.msg_type, &direct_socket_tx) {
-                (UdpMessageType::Direct, Some(direct_socket)) => direct_socket,
-                _ => &socket_tx,
-            };
-
+            let socket_id = msg.socket_id;
             let dst = msg.dst;
-            let msg_type = msg.msg_type;
+
+            let socket = tx_sockets.get(socket_id).expect("valid socket_id");
 
             if !msg.payload.is_empty() {
                 if let Err(err) = priority_queues.try_push(msg) {
@@ -327,9 +283,9 @@ async fn tx(
             }
 
             trace!(
+                socket_id,
                 dst_addr = ?dst,
                 chunk_len = chunk.len(),
-                msg_type = ?msg_type,
                 "preparing udp send"
             );
 
@@ -420,11 +376,11 @@ mod tests {
 
     fn create_test_msg(priority: UdpPriority, payload_size: usize) -> UdpMsg {
         UdpMsg {
+            socket_id: 0,
             dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
             payload: Bytes::from(vec![0u8; payload_size]),
             stride: 1024,
             priority,
-            msg_type: UdpMessageType::Broadcast,
         }
     }
 

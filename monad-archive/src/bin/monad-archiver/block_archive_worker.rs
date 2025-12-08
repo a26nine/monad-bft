@@ -20,48 +20,60 @@ use std::{
 
 use eyre::Result;
 use futures::{join, StreamExt, TryStreamExt};
+use monad_archive::prelude::*;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::prelude::*;
+pub struct ArchiveWorkerOpts {
+    /// Maximum number of blocks to process in one iteration
+    pub max_blocks_per_iteration: u64,
+    /// Maximum number of blocks to process concurrently
+    pub max_concurrent_blocks: usize,
+    /// Optional block number to stop archiving at
+    pub stop_block: Option<u64>,
+    /// If set, archiver will skip blocks that fail to archive
+    pub unsafe_skip_bad_blocks: bool,
+    /// If set, archiver will require traces to be present for all blocks
+    pub require_traces: bool,
+    /// If set, archiver will only archive traces
+    pub traces_only: bool,
+    /// If set, archiver will perform an asynchronous backfill of the archive
+    pub async_backfill: bool,
+}
 
 /// Main worker that archives block data from the execution database to durable storage.
 /// Continuously polls for new blocks and archives their data.
-///
-/// # Arguments
-/// * `block_data_source` - Source to read block data from (typically triedb)
-/// * `archive_writer` - Archive to write block data to (typically S3)
-/// * `max_blocks_per_iteration` - Maximum number of blocks to process in one iteration
-/// * `max_concurrent_blocks` - Maximum number of blocks to process concurrently
-/// * `start_block_override` - Optional block number to start archiving from
-/// * `stop_block_override` - Optional block number to stop archiving at
-/// * `metrics` - Metrics collection interface
 pub async fn archive_worker(
     block_data_source: (impl BlockDataReader + Sync),
     fallback_source: Option<(impl BlockDataReader + Sync)>,
     archive_writer: BlockDataArchive,
-    max_blocks_per_iteration: u64,
-    max_concurrent_blocks: usize,
-    mut start_block_override: Option<u64>,
-    stop_block_override: Option<u64>,
-    unsafe_skip_bad_blocks: bool,
+    opts: ArchiveWorkerOpts,
     metrics: Metrics,
 ) {
-    // initialize starting block using either override or stored latest
-    let mut start_block = match start_block_override.take() {
-        Some(start_block) => start_block,
-        None => {
-            let latest_uploaded = archive_writer
-                .get_latest(LatestKind::Uploaded)
-                .await
-                .unwrap_or(Some(0))
-                .unwrap_or(0);
-            if latest_uploaded == 0 {
-                0
-            } else {
-                latest_uploaded + 1
-            }
-        }
+    let ArchiveWorkerOpts {
+        max_blocks_per_iteration,
+        max_concurrent_blocks,
+        stop_block: stop_block_override,
+        unsafe_skip_bad_blocks,
+        require_traces,
+        traces_only,
+        async_backfill,
+    } = opts;
+    let latest_kind = if async_backfill {
+        LatestKind::UploadedAsyncBackfill
+    } else {
+        LatestKind::Uploaded
+    };
+    // initialize starting block from stored latest marker
+    let latest_uploaded = archive_writer
+        .get_latest(latest_kind)
+        .await
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+    let mut start_block = if latest_uploaded == 0 {
+        0
+    } else {
+        latest_uploaded + 1
     };
 
     loop {
@@ -107,6 +119,9 @@ pub async fn archive_worker(
             &metrics,
             max_concurrent_blocks,
             unsafe_skip_bad_blocks,
+            require_traces,
+            traces_only,
+            latest_kind,
         )
         .await;
 
@@ -126,12 +141,25 @@ async fn archive_blocks(
     metrics: &Metrics,
     concurrency: usize,
     unsafe_skip_bad_blocks: bool,
+    require_traces: bool,
+    traces_only: bool,
+    latest_kind: LatestKind,
 ) -> u64 {
     let start = Instant::now();
 
     let res: Result<(), u64> = futures::stream::iter(range.clone())
         .map(|block_num: u64| async move {
-            match archive_block(reader, fallback_reader, block_num, archiver, metrics).await {
+            match archive_block(
+                reader,
+                fallback_reader,
+                block_num,
+                archiver,
+                require_traces,
+                traces_only,
+                metrics,
+            )
+            .await
+            {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     if unsafe_skip_bad_blocks {
@@ -161,7 +189,7 @@ async fn archive_blocks(
     };
 
     if new_latest_uploaded != 0 {
-        checkpoint_latest(archiver, new_latest_uploaded).await;
+        checkpoint_latest(archiver, new_latest_uploaded, latest_kind).await;
     }
 
     new_latest_uploaded
@@ -172,12 +200,17 @@ async fn archive_block(
     fallback: &Option<impl BlockDataReader>,
     block_num: u64,
     archiver: &BlockDataArchive,
+    require_traces: bool,
+    traces_only: bool,
     metrics: &Metrics,
 ) -> Result<()> {
     let mut num_txs = None;
 
     let (block, receipts, traces) = join!(
         async {
+            if traces_only {
+                return Ok(());
+            }
             let block = match reader.get_block_by_number(block_num).await {
                 Ok(b) => b,
                 Err(e) => {
@@ -196,6 +229,9 @@ async fn archive_block(
             archiver.archive_block(block).await
         },
         async {
+            if traces_only {
+                return Ok(());
+            }
             let receipts = match reader.get_block_receipts(block_num).await {
                 Ok(b) => b,
                 Err(e) => {
@@ -240,6 +276,9 @@ async fn archive_block(
     // Failing to archive traces is not a critical error, so we log and continue.
     if let Err(e) = traces {
         metrics.inc_counter(MetricNames::BLOCK_ARCHIVE_WORKER_TRACES_FAILED);
+        if require_traces || traces_only {
+            return Err(e.wrap_err("Archiver requires traces to be present for all blocks"));
+        }
         error!(
             block_num,
             "Failed to archive traces for block {block_num}. Continuing... Cause: {e:?}"
@@ -250,11 +289,8 @@ async fn archive_block(
     Ok(())
 }
 
-async fn checkpoint_latest(archiver: &BlockDataArchive, block_num: u64) {
-    match archiver
-        .update_latest(block_num, LatestKind::Uploaded)
-        .await
-    {
+async fn checkpoint_latest(archiver: &BlockDataArchive, block_num: u64, latest_kind: LatestKind) {
+    match archiver.update_latest(block_num, latest_kind).await {
         Ok(()) => info!(block_num, "Set latest uploaded checkpoint"),
         Err(e) => error!(block_num, "Failed to set latest uploaded block: {e:?}"),
     }
@@ -268,10 +304,10 @@ mod tests {
     use alloy_primitives::{Bloom, Log, B256, U256};
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
+    use monad_archive::{kvstore::memory::MemoryStorage, metrics, test_utils::mock_block};
     use monad_triedb_utils::triedb_env::{ReceiptWithLogIndex, TxEnvelopeWithSender};
 
     use super::*;
-    use crate::{kvstore::memory::MemoryStorage, metrics, test_utils::mock_block};
 
     fn mock_tx() -> TxEnvelopeWithSender {
         let tx = TxEip1559 {
@@ -334,6 +370,31 @@ mod tests {
             .unwrap();
     }
 
+    async fn mock_source_without_traces(
+        archive: &BlockDataArchive,
+        data: impl IntoIterator<Item = (Block, BlockReceipts)>,
+    ) {
+        let mut max_block_num = u64::MIN;
+        for (block, receipts) in data {
+            let block_num = block.header.number;
+
+            if block_num > max_block_num {
+                max_block_num = block_num;
+            }
+
+            archive.archive_block(block.clone()).await.unwrap();
+            archive
+                .archive_receipts(receipts.clone(), block_num)
+                .await
+                .unwrap();
+        }
+
+        archive
+            .update_latest(max_block_num, LatestKind::Uploaded)
+            .await
+            .unwrap();
+    }
+
     fn memory_sink_source() -> (BlockDataArchive, BlockDataArchive) {
         let source: KVStoreErased = MemoryStorage::new("source").into();
         let reader = BlockDataArchive::new(source);
@@ -365,6 +426,8 @@ mod tests {
             &Some(fallback_reader),
             block_num,
             &archiver,
+            false,
+            false,
             &metrics::Metrics::none(),
         )
         .await;
@@ -396,6 +459,8 @@ mod tests {
             &None::<BlockDataReaderErased>,
             block_num,
             &archiver,
+            false,
+            false,
             &metrics::Metrics::none(),
         )
         .await;
@@ -437,6 +502,9 @@ mod tests {
             &metrics::Metrics::none(),
             3,
             false,
+            false,
+            false,
+            LatestKind::Uploaded,
         )
         .await;
 
@@ -481,6 +549,9 @@ mod tests {
             &metrics::Metrics::none(),
             3,
             false,
+            false,
+            false,
+            LatestKind::Uploaded,
         )
         .await;
 
@@ -489,5 +560,208 @@ mod tests {
             archiver.get_latest(LatestKind::Uploaded).await.unwrap(),
             Some(end_of_first_chunk)
         );
+    }
+
+    #[tokio::test]
+    async fn archive_block_without_traces_allowed() {
+        let (reader, archiver) = memory_sink_source();
+
+        let block_num = 42;
+        let block = mock_block(block_num, vec![mock_tx()]);
+        let receipts = vec![mock_rx()];
+
+        mock_source_without_traces(&reader, [(block.clone(), receipts.clone())]).await;
+        assert!(reader.get_block_traces(block_num).await.is_err());
+
+        let res = archive_block(
+            &reader,
+            &None::<BlockDataReaderErased>,
+            block_num,
+            &archiver,
+            false,
+            false,
+            &metrics::Metrics::none(),
+        )
+        .await;
+
+        assert!(res.is_ok());
+        assert_eq!(
+            archiver.get_block_by_number(block_num).await.unwrap(),
+            block
+        );
+        assert_eq!(
+            archiver.get_block_receipts(block_num).await.unwrap(),
+            receipts
+        );
+        assert!(archiver.get_block_traces(block_num).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn archive_block_without_traces_requires_traces() {
+        let (reader, archiver) = memory_sink_source();
+
+        let block_num = 43;
+        let block = mock_block(block_num, vec![mock_tx()]);
+        let receipts = vec![mock_rx()];
+
+        mock_source_without_traces(&reader, [(block.clone(), receipts.clone())]).await;
+        assert!(reader.get_block_traces(block_num).await.is_err());
+
+        let res = archive_block(
+            &reader,
+            &None::<BlockDataReaderErased>,
+            block_num,
+            &archiver,
+            true,
+            false,
+            &metrics::Metrics::none(),
+        )
+        .await;
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Archiver requires traces to be present for all blocks"));
+        assert_eq!(
+            archiver.get_block_by_number(block_num).await.unwrap(),
+            block
+        );
+        assert_eq!(
+            archiver.get_block_receipts(block_num).await.unwrap(),
+            receipts
+        );
+        assert!(archiver.get_block_traces(block_num).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn archive_block_with_traces_only() {
+        let (reader, archiver) = memory_sink_source();
+        let block_num = 44;
+        let block = mock_block(block_num, vec![mock_tx()]);
+        let receipts = vec![mock_rx()];
+        let traces = vec![vec![], vec![2]];
+
+        mock_source(&reader, [(block.clone(), receipts.clone(), traces.clone())]).await;
+        let res = archive_block(
+            &reader,
+            &None::<BlockDataReaderErased>,
+            block_num,
+            &archiver,
+            false,
+            true,
+            &metrics::Metrics::none(),
+        )
+        .await;
+        assert!(res.is_ok());
+        assert!(archiver.get_block_by_number(block_num).await.is_err());
+        assert!(archiver.get_block_receipts(block_num).await.is_err());
+        assert!(archiver.get_block_traces(block_num).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_blocks_with_traces_only() {
+        let (reader, archiver) = memory_sink_source();
+
+        let row = |b| {
+            (
+                mock_block(b, vec![mock_tx()]),
+                vec![mock_rx()],
+                vec![vec![], vec![2]],
+            )
+        };
+        mock_source(&reader, (0..=10).map(row)).await;
+
+        let end_block = archive_blocks(
+            &reader,
+            &None::<BlockDataReaderErased>,
+            0..=10,
+            &archiver,
+            &metrics::Metrics::none(),
+            3,
+            false,
+            false,
+            true,
+            LatestKind::Uploaded,
+        )
+        .await;
+
+        assert_eq!(end_block, 10);
+        assert_eq!(
+            archiver.get_latest(LatestKind::Uploaded).await.unwrap(),
+            Some(10)
+        );
+        assert!(archiver.get_block_by_number(5).await.is_err());
+        assert!(archiver.get_block_receipts(5).await.is_err());
+        assert!(archiver.get_block_traces(5).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_blocks_async_backfill_with_start_stop() {
+        // This test verifies that async_backfill mode correctly reads from the
+        // source's LatestKind::Uploaded marker while writing progress to its own
+        // LatestKind::UploadedAsyncBackfill marker. Previously, the worker would
+        // query get_latest(LatestKind::UploadedAsyncBackfill) from the source,
+        // which wouldn't exist, causing it to find no blocks to process.
+        let (reader, archiver) = memory_sink_source();
+
+        let row = |b| {
+            (
+                mock_block(b, vec![mock_tx()]),
+                vec![mock_rx()],
+                vec![vec![], vec![2]],
+            )
+        };
+        // Source has blocks 0-20 with LatestKind::Uploaded set to 20
+        mock_source(&reader, (0..=20).map(row)).await;
+
+        assert_eq!(
+            reader.get_latest(LatestKind::Uploaded).await.unwrap(),
+            Some(20)
+        );
+        // Source does NOT have UploadedAsyncBackfill marker set
+        assert_eq!(
+            reader
+                .get_latest(LatestKind::UploadedAsyncBackfill)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Simulate async_backfill archiving a subset (blocks 5-10)
+        let end_block = archive_blocks(
+            &reader,
+            &None::<BlockDataReaderErased>,
+            5..=10,
+            &archiver,
+            &metrics::Metrics::none(),
+            3,
+            false,
+            false,
+            false,
+            LatestKind::UploadedAsyncBackfill,
+        )
+        .await;
+
+        assert_eq!(end_block, 10);
+        // Archiver should have UploadedAsyncBackfill marker set
+        assert_eq!(
+            archiver
+                .get_latest(LatestKind::UploadedAsyncBackfill)
+                .await
+                .unwrap(),
+            Some(10)
+        );
+        // Regular Uploaded marker should NOT be set
+        assert_eq!(
+            archiver.get_latest(LatestKind::Uploaded).await.unwrap(),
+            None
+        );
+        // Verify blocks were archived
+        assert!(archiver.get_block_by_number(5).await.is_ok());
+        assert!(archiver.get_block_by_number(10).await.is_ok());
+        // Blocks outside the range should not exist
+        assert!(archiver.get_block_by_number(4).await.is_err());
+        assert!(archiver.get_block_by_number(11).await.is_err());
     }
 }
