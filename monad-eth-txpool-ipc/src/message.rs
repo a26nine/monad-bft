@@ -13,15 +13,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub mod metrics;
-pub mod protocol;
-pub mod socket;
+use alloy_consensus::TxEnvelope;
+use alloy_primitives::U256;
+use alloy_rlp::{RlpDecodable, RlpEncodable};
+use monad_eth_txpool_types::DEFAULT_TX_PRIORITY;
 
-pub use metrics::{
-    GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_READ,
-    GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
-    GAUGE_RAPTORCAST_AUTH_NON_AUTHENTICATED_UDP_BYTES_READ,
-    GAUGE_RAPTORCAST_AUTH_NON_AUTHENTICATED_UDP_BYTES_WRITTEN,
-};
-pub use protocol::{AuthenticationProtocol, NoopAuthProtocol, NoopHeader, WireAuthProtocol};
-pub use socket::{AuthRecvMsg, AuthenticatedSocketHandle, DualSocketHandle};
+#[derive(RlpEncodable, RlpDecodable)]
+pub struct EthTxPoolIpcTx {
+    pub tx: TxEnvelope,
+    pub priority: U256,
+
+    // TODO(andr-dev): Pass extra_data to custom sequencers
+    pub extra_data: Vec<u8>,
+}
+
+impl EthTxPoolIpcTx {
+    pub fn new_with_default_priority(tx: TxEnvelope, extra_data: Vec<u8>) -> Self {
+        Self {
+            tx,
+            priority: DEFAULT_TX_PRIORITY,
+            extra_data,
+        }
+    }
+}

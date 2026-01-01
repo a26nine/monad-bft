@@ -557,7 +557,8 @@ where
 
     let network_config = node_config.network;
 
-    let mut dp_builder = DataplaneBuilder::new(&bind_address, network_config.max_mbps.into());
+    let mut dp_builder = DataplaneBuilder::new(&bind_address, network_config.max_mbps.into())
+        .with_udp_multishot(network_config.enable_udp_multishot);
     if let Some(buffer_size) = network_config.buffer_size {
         dp_builder = dp_builder.with_udp_buffer_size(buffer_size);
     }
@@ -583,18 +584,24 @@ where
     }
     dp_builder = dp_builder.extend_udp_sockets(udp_sockets);
 
+    // auth port in peer discovery config and network config should be set and unset simultaneously
+    assert_eq!(
+        peer_discovery_config.self_auth_port.is_some(),
+        network_config.authenticated_bind_address_port.is_some()
+    );
+
     let self_id = NodeId::new(identity.pubkey());
-    let self_record = match network_config.authenticated_bind_address_port {
+    let self_record = match peer_discovery_config.self_auth_port {
         Some(auth_port) => NameRecord::new_with_authentication(
             *name_record_address.ip(),
             name_record_address.port(),
-            network_config.bind_address_port,
+            name_record_address.port(),
             auth_port,
             peer_discovery_config.self_record_seq_num,
         ),
         None => NameRecord::new(
             *name_record_address.ip(),
-            network_config.bind_address_port,
+            name_record_address.port(),
             peer_discovery_config.self_record_seq_num,
         ),
     };
@@ -702,6 +709,7 @@ where
             shared_key,
             mtu: network_config.mtu,
             udp_message_max_age_ms: network_config.udp_message_max_age_ms,
+            sig_verification_rate_limit: network_config.signature_verifications_per_second,
             primary_instance: RaptorCastConfigPrimary {
                 raptor10_redundancy: 2.5f32,
                 fullnode_dedicated: full_nodes

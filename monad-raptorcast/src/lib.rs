@@ -215,7 +215,11 @@ where
 
             current_epoch,
 
-            udp_state: udp::UdpState::new(self_id, config.udp_message_max_age_ms),
+            udp_state: udp::UdpState::new(
+                self_id,
+                config.udp_message_max_age_ms,
+                config.sig_verification_rate_limit,
+            ),
 
             tcp_reader,
             tcp_writer,
@@ -565,6 +569,7 @@ where
         shared_key,
         mtu: DEFAULT_MTU,
         udp_message_max_age_ms: u64::MAX, // No timestamp validation for tests
+        sig_verification_rate_limit: 10_000,
         primary_instance: Default::default(),
         secondary_instance: FullNodeRaptorCastConfig {
             enable_publisher: false,
@@ -641,6 +646,7 @@ where
         shared_key: shared_key.clone(),
         mtu: DEFAULT_MTU,
         udp_message_max_age_ms: u64::MAX,
+        sig_verification_rate_limit: 10_000,
         primary_instance: Default::default(),
         secondary_instance: FullNodeRaptorCastConfig {
             enable_publisher: false,
@@ -894,11 +900,12 @@ where
         }
     }
 
-    fn metrics(&self) -> ExecutorMetricsChain {
+    fn metrics(&self) -> ExecutorMetricsChain<'_> {
         ExecutorMetricsChain::default()
             .push(self.metrics.as_ref())
             .push(self.peer_discovery_metrics.as_ref())
             .push(self.udp_state.metrics().executor_metrics())
+            .chain(self.udp_state.decoder_metrics())
             .chain(self.dual_socket.metrics())
     }
 }
@@ -1026,9 +1033,20 @@ where
                             match &this.channel_to_secondary {
                                 Some(channel) => {
                                     // drop full node group message with unauthorized sender
+                                    let Some(current_epoch_validators) =
+                                        this.epoch_validators.get(&this.current_epoch)
+                                    else {
+                                        warn!(
+                                            "No validators found for current epoch: {:?}",
+                                            this.current_epoch
+                                        );
+                                        continue;
+                                    };
+
                                     if !validate_group_message_sender(
                                         &from,
                                         &full_nodes_group_message,
+                                        current_epoch_validators,
                                     ) {
                                         warn!(
                                             ?from,
@@ -1294,12 +1312,16 @@ where
 fn validate_group_message_sender<ST>(
     sender: &NodeId<CertificateSignaturePubKey<ST>>,
     group_message: &FullNodesGroupMessage<ST>,
+    epoch_validators: &EpochValidators<ST>,
 ) -> bool
 where
     ST: CertificateSignatureRecoverable,
 {
     match group_message {
-        FullNodesGroupMessage::PrepareGroup(msg) => &msg.validator_id == sender,
+        // Prepare group message should originate from a validator
+        FullNodesGroupMessage::PrepareGroup(msg) => {
+            &msg.validator_id == sender && epoch_validators.validators.contains_key(sender)
+        }
         FullNodesGroupMessage::PrepareGroupResponse(msg) => &msg.node_id == sender,
         FullNodesGroupMessage::ConfirmGroup(msg) => &msg.prepare.validator_id == sender,
     }

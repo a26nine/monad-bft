@@ -48,6 +48,12 @@ pub struct NodeNetworkConfig {
 
     #[serde(default = "default_tcp_rate_limit_burst")]
     pub tcp_rate_limit_burst: u32,
+
+    #[serde(default = "default_signature_verifications_per_second")]
+    pub signature_verifications_per_second: u32,
+
+    #[serde(default = "default_enable_udp_mutishot")]
+    pub enable_udp_multishot: bool,
 }
 
 fn default_mtu() -> u16 {
@@ -77,4 +83,12 @@ fn default_tcp_rate_limit_rps() -> u32 {
 
 fn default_tcp_rate_limit_burst() -> u32 {
     200
+}
+
+fn default_signature_verifications_per_second() -> u32 {
+    4_000
+}
+
+fn default_enable_udp_mutishot() -> bool {
+    true
 }

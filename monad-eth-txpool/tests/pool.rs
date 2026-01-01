@@ -45,6 +45,7 @@ use monad_eth_testutil::{
 };
 use monad_eth_txpool::{
     max_eip2718_encoded_length, EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics,
+    PoolTransactionKind,
 };
 use monad_eth_txpool_types::EthTxPoolSnapshot;
 use monad_state_backend::{InMemoryBlockState, InMemoryState, InMemoryStateInner};
@@ -202,8 +203,14 @@ fn run_custom_iter<const N: usize>(
                         &eth_block_policy,
                         &state_backend,
                         &MockChainConfig::DEFAULT,
-                        vec![tx.clone()],
-                        owned,
+                        vec![(
+                            tx.clone(),
+                            if owned {
+                                PoolTransactionKind::owned_default()
+                            } else {
+                                PoolTransactionKind::Forwarded
+                            },
+                        )],
                         |inserted_tx| {
                             assert_eq!(&tx, inserted_tx.raw());
 
@@ -238,7 +245,11 @@ fn run_custom_iter<const N: usize>(
                 let pool_previous_num_txs = pool.num_txs();
 
                 let mut num_inserted = 0;
-                let num_expected = should_insert.then_some(txs.len()).unwrap_or_default();
+                let num_expected = if should_insert {
+                    txs.len()
+                } else {
+                    Default::default()
+                };
 
                 pool.insert_txs(
                     &mut event_tracker,
@@ -248,8 +259,17 @@ fn run_custom_iter<const N: usize>(
                     txs.into_iter()
                         .map(ToOwned::to_owned)
                         .map(recover_tx)
+                        .map(|tx| {
+                            (
+                                tx,
+                                if owned {
+                                    PoolTransactionKind::owned_default()
+                                } else {
+                                    PoolTransactionKind::Forwarded
+                                },
+                            )
+                        })
                         .collect(),
-                    owned,
                     |_| {
                         if !should_insert {
                             panic!("tx inserted when it shouldn't have been!");

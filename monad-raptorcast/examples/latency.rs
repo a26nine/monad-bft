@@ -272,6 +272,7 @@ fn create_raptorcast_config(keypair: Arc<KeyPair>) -> RaptorCastConfig<Signature
         shared_key: keypair,
         mtu: monad_dataplane::udp::DEFAULT_MTU,
         udp_message_max_age_ms: 5000,
+        sig_verification_rate_limit: 4_000,
         primary_instance: RaptorCastConfigPrimary::default(),
         secondary_instance: FullNodeRaptorCastConfig {
             enable_publisher: false,
@@ -598,6 +599,7 @@ fn setup_node(
         SocketAddr::V4(SocketAddrV4::new(bind_ip, my_config.udp_addr.port()));
 
     let dataplane = DataplaneBuilder::new(&tcp_addr, UDP_BW)
+        .with_udp_multishot(true)
         .extend_udp_sockets(vec![
             monad_dataplane::UdpSocketConfig {
                 socket_addr: authenticated_udp_addr,
