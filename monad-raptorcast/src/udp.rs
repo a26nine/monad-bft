@@ -29,6 +29,7 @@ use monad_dataplane::udp::{segment_size_for_mtu, ETHERNET_SEGMENT_SIZE};
 use monad_executor::ExecutorMetricsChain;
 use monad_merkle::{MerkleHash, MerkleProof};
 use monad_types::{Epoch, NodeId, Round};
+use monad_validator::validator_set::ValidatorSetType as _;
 use tracing::warn;
 
 pub use crate::packet::build_messages;
@@ -154,8 +155,8 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
     #[tracing::instrument(level = "debug", name = "udp_handle_message", skip_all)]
     pub fn handle_message(
         &mut self,
-        group_map: &ReBroadcastGroupMap<ST>,
-        epoch_validators: &BTreeMap<Epoch, EpochValidators<ST>>,
+        group_map: &ReBroadcastGroupMap<CertificateSignaturePubKey<ST>>,
+        epoch_validators: &BTreeMap<Epoch, EpochValidators<CertificateSignaturePubKey<ST>>>,
         rebroadcast: impl FnMut(Vec<NodeId<CertificateSignaturePubKey<ST>>>, Bytes, u16),
         message: crate::auth::AuthRecvMsg<CertificateSignaturePubKey<ST>>,
     ) -> Vec<(NodeId<CertificateSignaturePubKey<ST>>, Bytes)> {
@@ -188,7 +189,7 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
                             let node_id = NodeId::new(*pk);
                             epoch_validators
                                 .get(&epoch)
-                                .is_some_and(|ev| ev.validators.contains_key(&node_id))
+                                .is_some_and(|ev| ev.validators.is_member(&node_id))
                         }
                         _ => false,
                     };
@@ -803,6 +804,7 @@ mod tests {
     use monad_dataplane::udp::DEFAULT_SEGMENT_SIZE;
     use monad_secp::{KeyPair, SecpSignature};
     use monad_types::{Epoch, NodeId, Round, RoundSpan, Stake};
+    use monad_validator::validator_set::{ValidatorSet, ValidatorSetType as _};
     use rstest::*;
 
     use super::{GroupId, MessageValidationError, UdpState};
@@ -819,7 +821,7 @@ mod tests {
 
     fn validator_set() -> (
         KeyPairType,
-        EpochValidators<SignatureType>,
+        EpochValidators<CertificateSignaturePubKey<SignatureType>>,
         HashMap<NodeId<CertificateSignaturePubKey<SignatureType>>, SocketAddr>,
     ) {
         const NUM_KEYS: u8 = 100;
@@ -832,11 +834,12 @@ mod tests {
             })
             .collect_vec();
 
+        let valset = keys
+            .iter()
+            .map(|key| (NodeId::new(key.pubkey()), Stake::ONE))
+            .collect();
         let validators = EpochValidators {
-            validators: keys
-                .iter()
-                .map(|key| (NodeId::new(key.pubkey()), Stake::ONE))
-                .collect(),
+            validators: ValidatorSet::new_unchecked(valset),
         };
 
         let known_addresses = keys
@@ -1109,6 +1112,7 @@ mod tests {
         let mut group_map = ReBroadcastGroupMap::new(self_id);
         let node_stake_pairs: Vec<_> = validators
             .validators
+            .get_members()
             .iter()
             .map(|(node_id, stake)| (*node_id, *stake))
             .collect();
@@ -1205,7 +1209,7 @@ mod tests {
         #[case] raptorcast: bool,
         #[case] should_succeed: bool,
     ) {
-        let (key, validators, known_addresses) = validator_set();
+        let (key, validators, _known_addresses) = validator_set();
         let epoch_validators = validators.view_without(vec![&NodeId::new(key.pubkey())]);
         let target = if raptorcast {
             BuildTarget::Raptorcast(epoch_validators)
@@ -1213,7 +1217,7 @@ mod tests {
             BuildTarget::Broadcast(epoch_validators.into())
         };
         let app_msg = vec![0; app_msg_len];
-        let messages = MessageBuilder::new(&key, known_addresses)
+        let messages = MessageBuilder::<SignatureType>::new(&key)
             .segment_size(DEFAULT_SEGMENT_SIZE as usize)
             .group_id(GroupId::Primary(EPOCH))
             .redundancy(Redundancy::from_u8(1))
