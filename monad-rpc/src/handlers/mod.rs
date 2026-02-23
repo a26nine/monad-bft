@@ -51,9 +51,9 @@ use self::{
     },
     meta::{monad_net_version, monad_web3_client_version},
     resources::MonadRpcResources,
+    txpool::{monad_txpool_statusByAddress, monad_txpool_statusByHash},
 };
 use crate::{
-    eth_json_types::serialize_result,
     handlers::{
         debug::{
             MonadDebugTraceBlockByHashParams, MonadDebugTraceBlockByNumberParams,
@@ -61,12 +61,14 @@ use crate::{
         },
         eth::call::monad_createAccessList,
     },
-    jsonrpc::{
-        serialize_with_size_limit, JsonRpcError, JsonRpcResultExt, Request, RequestParams,
-        RequestWrapper, Response, ResponseWrapper,
+    middleware::TimingRequestId,
+    types::{
+        eth_json::serialize_result,
+        jsonrpc::{
+            serialize_with_size_limit, JsonRpcError, JsonRpcResultExt, Request, RequestId,
+            RequestParams, RequestWrapper, Response, ResponseWrapper,
+        },
     },
-    timing::RequestId,
-    vpool::{monad_txpool_statusByAddress, monad_txpool_statusByHash},
 };
 
 mod debug;
@@ -74,12 +76,13 @@ mod debug_replay;
 pub mod eth;
 mod meta;
 pub mod resources;
+mod txpool;
 
 pub async fn rpc_handler(
     root_span: RootSpan,
     body: bytes::Bytes,
     app_state: web::Data<MonadRpcResources>,
-    request_id: RequestId,
+    request_id: TimingRequestId,
 ) -> HttpResponse {
     let request = match RequestWrapper::from_body_bytes(&body) {
         Ok(req) => req,
@@ -139,10 +142,7 @@ pub async fn rpc_handler(
 
                     async move {
                         let Ok(request) = Request::from_raw_value(json_request) else {
-                            return (
-                                crate::jsonrpc::RequestId::Null,
-                                Err(JsonRpcError::invalid_request()),
-                            );
+                            return (RequestId::Null, Err(JsonRpcError::invalid_request()));
                         };
                         let (state, id, method, params) =
                             (app_state, request.id, request.method, request.params);
@@ -185,7 +185,7 @@ pub async fn rpc_handler(
 
 #[allow(non_snake_case)]
 async fn admin_ethCallStatistics(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -212,7 +212,7 @@ async fn admin_ethCallStatistics(
 
 #[allow(non_snake_case)]
 async fn debug_getRawBlock(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -225,7 +225,7 @@ async fn debug_getRawBlock(
 
 #[allow(non_snake_case)]
 async fn debug_getRawHeader(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -238,7 +238,7 @@ async fn debug_getRawHeader(
 
 #[allow(non_snake_case)]
 async fn debug_getRawReceipts(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -251,7 +251,7 @@ async fn debug_getRawReceipts(
 
 #[allow(non_snake_case)]
 async fn debug_getRawTransaction(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -264,7 +264,7 @@ async fn debug_getRawTransaction(
 
 #[allow(non_snake_case)]
 async fn debug_traceBlockByHash(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -283,7 +283,7 @@ async fn debug_traceBlockByHash(
 
 #[allow(non_snake_case)]
 async fn debug_traceBlockByNumber(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -303,7 +303,7 @@ async fn debug_traceBlockByNumber(
 
 #[allow(non_snake_case)]
 async fn debug_traceCall(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -331,7 +331,7 @@ async fn debug_traceCall(
 
 #[allow(non_snake_case)]
 async fn debug_traceTransaction(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -351,7 +351,7 @@ async fn debug_traceTransaction(
 
 #[allow(non_snake_case)]
 async fn eth_call(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -398,7 +398,7 @@ async fn eth_call(
 
 #[allow(non_snake_case)]
 async fn eth_sendRawTransaction(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -418,7 +418,7 @@ async fn eth_sendRawTransaction(
 
 #[allow(non_snake_case)]
 async fn eth_sendRawTransactionSync(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -445,7 +445,7 @@ async fn eth_sendRawTransactionSync(
 
 #[allow(non_snake_case)]
 async fn eth_createAccessList(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -473,7 +473,7 @@ async fn eth_createAccessList(
 
 #[allow(non_snake_case)]
 async fn eth_getLogs(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -497,7 +497,7 @@ async fn eth_getLogs(
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -513,7 +513,7 @@ async fn eth_getTransactionByHash(
 
 #[allow(non_snake_case)]
 async fn eth_getBlockByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -529,7 +529,7 @@ async fn eth_getBlockByHash(
 
 #[allow(non_snake_case)]
 async fn eth_getBlockByNumber(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -545,7 +545,7 @@ async fn eth_getBlockByNumber(
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionByBlockHashAndIndex(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -561,7 +561,7 @@ async fn eth_getTransactionByBlockHashAndIndex(
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionByBlockNumberAndIndex(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -577,7 +577,7 @@ async fn eth_getTransactionByBlockNumberAndIndex(
 
 #[allow(non_snake_case)]
 async fn eth_getBlockTransactionCountByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -593,7 +593,7 @@ async fn eth_getBlockTransactionCountByHash(
 
 #[allow(non_snake_case)]
 async fn eth_getBlockTransactionCountByNumber(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -609,7 +609,7 @@ async fn eth_getBlockTransactionCountByNumber(
 
 #[allow(non_snake_case)]
 async fn eth_getBalance(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -625,7 +625,7 @@ async fn eth_getBalance(
 
 #[allow(non_snake_case)]
 async fn eth_getCode(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -641,7 +641,7 @@ async fn eth_getCode(
 
 #[allow(non_snake_case)]
 async fn eth_getStorageAt(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -657,7 +657,7 @@ async fn eth_getStorageAt(
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionCount(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -673,7 +673,7 @@ async fn eth_getTransactionCount(
 
 #[allow(non_snake_case)]
 async fn eth_blockNumber(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -688,7 +688,7 @@ async fn eth_blockNumber(
 
 #[allow(non_snake_case)]
 async fn eth_chainId(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -699,7 +699,7 @@ async fn eth_chainId(
 
 #[allow(non_snake_case)]
 async fn eth_syncing(
-    _: RequestId,
+    _: TimingRequestId,
     _app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -708,7 +708,7 @@ async fn eth_syncing(
 
 #[allow(non_snake_case)]
 async fn eth_estimateGas(
-    request_id: RequestId,
+    request_id: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -756,7 +756,7 @@ async fn eth_estimateGas(
 
 #[allow(non_snake_case)]
 async fn eth_gasPrice(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -771,7 +771,7 @@ async fn eth_gasPrice(
 
 #[allow(non_snake_case)]
 async fn eth_maxPriorityFeePerGas(
-    _: RequestId,
+    _: TimingRequestId,
     _app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -782,7 +782,7 @@ async fn eth_maxPriorityFeePerGas(
 
 #[allow(non_snake_case)]
 async fn eth_feeHistory(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -798,7 +798,7 @@ async fn eth_feeHistory(
 
 #[allow(non_snake_case)]
 async fn eth_getTransactionReceipt(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -814,7 +814,7 @@ async fn eth_getTransactionReceipt(
 
 #[allow(non_snake_case)]
 async fn eth_getBlockReceipts(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -827,7 +827,7 @@ async fn eth_getBlockReceipts(
 
 #[allow(non_snake_case)]
 async fn net_version(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -836,7 +836,7 @@ async fn net_version(
 
 #[allow(non_snake_case)]
 async fn txpool_statusByHash(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -851,7 +851,7 @@ async fn txpool_statusByHash(
 
 #[allow(non_snake_case)]
 async fn txpool_statusByAddress(
-    _: RequestId,
+    _: TimingRequestId,
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -866,7 +866,7 @@ async fn txpool_statusByAddress(
 
 #[allow(non_snake_case)]
 async fn web3_clientVersion(
-    _: RequestId,
+    _: TimingRequestId,
     _app_state: &MonadRpcResources,
     _params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -909,7 +909,7 @@ macro_rules! enabled_methods {
 
             async fn call(
                 &self,
-                request_id: RequestId,
+                request_id: TimingRequestId,
                 app_state: &MonadRpcResources,
                 params: RequestParams<'_>,
             ) -> Result<Box<RawValue>, JsonRpcError> {
@@ -969,7 +969,7 @@ pub async fn rpc_select(
     app_state: &MonadRpcResources,
     method: &str,
     params: RequestParams<'_>,
-    request_id: RequestId,
+    request_id: TimingRequestId,
 ) -> Result<Box<RawValue>, JsonRpcError> {
     let method: EnabledMethod = method.try_into()?;
     let mut span = method.span();

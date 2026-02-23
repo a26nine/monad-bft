@@ -25,7 +25,7 @@ use std::{
 
 use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEip7702, TxEnvelope, TxLegacy};
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::{Address, PrimitiveSignature, TxKind, Uint, B256, U256, U64, U8};
+use alloy_primitives::{Address, Signature, TxKind, Uint, B256, U256, U64, U8};
 use alloy_rpc_types::{AccessList, AccessListItem, AccessListResult};
 use monad_chain_config::execution_revision::MonadExecutionRevision;
 use monad_ethcall::{eth_call, CallResult, EthCallExecutor, MonadTracer, StateOverrideSet};
@@ -42,11 +42,13 @@ use tracing::{debug, trace};
 
 use super::block::get_block_key_from_tag_or_hash;
 use crate::{
-    eth_json_types::BlockTagOrHash,
     handlers::debug::{decode_call_frame, Tracer, TracerObject},
     hex,
-    jsonrpc::{JsonRpcError, JsonRpcResult},
-    timing::RequestId,
+    middleware::TimingRequestId,
+    types::{
+        eth_json::BlockTagOrHash,
+        jsonrpc::{JsonRpcError, JsonRpcResult},
+    },
 };
 
 #[derive(Debug)]
@@ -83,12 +85,12 @@ impl Clone for CumulativeStats {
 
 #[derive(Debug, Default)]
 pub struct EthCallStatsTracker {
-    active_requests: Arc<Mutex<HashMap<RequestId, EthCallRequestStats>>>,
+    active_requests: Arc<Mutex<HashMap<TimingRequestId, EthCallRequestStats>>>,
     stats: CumulativeStats,
 }
 
 impl EthCallStatsTracker {
-    pub async fn record_request_start(&self, request_id: RequestId) {
+    pub async fn record_request_start(&self, request_id: TimingRequestId) {
         let mut requests = self.active_requests.lock().await;
         requests.insert(
             request_id,
@@ -100,7 +102,7 @@ impl EthCallStatsTracker {
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub async fn record_request_complete(&self, request_id: &RequestId, is_error: bool) {
+    pub async fn record_request_complete(&self, request_id: &TimingRequestId, is_error: bool) {
         let mut requests = self.active_requests.lock().await;
         requests.remove(request_id);
 
@@ -307,7 +309,7 @@ impl TryFrom<CallRequest> for TxEnvelope {
                 // Legacy
 
                 // default signature as eth_call doesn't require it
-                let signature = PrimitiveSignature::new(U256::from(0), U256::from(0), false);
+                let signature = Signature::new(U256::from(0), U256::from(0), false);
                 let transaction = TxLegacy {
                     chain_id: call_request
                         .chain_id
@@ -352,7 +354,7 @@ impl TryFrom<CallRequest> for TxEnvelope {
                 // EIP-7702
 
                 // default signature as eth_call doesn't require it
-                let signature = PrimitiveSignature::new(U256::from(0), U256::from(0), false);
+                let signature = Signature::new(U256::from(0), U256::from(0), false);
                 let transaction = TxEip7702 {
                     chain_id: call_request
                         .chain_id
@@ -397,7 +399,7 @@ impl TryFrom<CallRequest> for TxEnvelope {
                 // EIP-1559
 
                 // default signature as eth_call doesn't require it
-                let signature = PrimitiveSignature::new(U256::from(0), U256::from(0), false);
+                let signature = Signature::new(U256::from(0), U256::from(0), false);
                 let transaction = TxEip1559 {
                     chain_id: call_request
                         .chain_id
@@ -593,6 +595,7 @@ pub struct MonadDebugTraceCallParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema, Clone)]
 pub struct MonadCreateAccessListParams {
     pub transaction: CallRequest,
+    #[serde(default)]
     pub block: BlockTagOrHash,
 }
 
@@ -1023,7 +1026,7 @@ mod tests {
             debug::Tracer,
             eth::call::{sender_gas_allowance, CallInput, MonadDebugTraceCallParams},
         },
-        jsonrpc::JsonRpcError,
+        types::jsonrpc::JsonRpcError,
     };
 
     #[test]

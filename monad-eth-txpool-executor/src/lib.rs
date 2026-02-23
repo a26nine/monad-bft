@@ -34,7 +34,7 @@ use monad_crypto::certificate_signature::{
 };
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_txpool::{
-    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, PoolTransactionKind, TrackedTxLimitsConfig,
+    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, PoolTxKind, TrackedTxLimitsConfig,
 };
 use monad_eth_txpool_types::{
     EthTxPoolDropReason, EthTxPoolEventType, EthTxPoolIpcTx, EthTxPoolTxInputStream,
@@ -112,7 +112,6 @@ where
         chain_config: CCT,
         round: Round,
         execution_timestamp_s: u64,
-        do_local_insert: bool,
     ) -> io::Result<EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>> {
         let ipc = Box::pin(EthTxPoolIpcServer::new(ipc_config)?);
 
@@ -138,7 +137,6 @@ where
                                 soft_tx_expiry,
                                 hard_tx_expiry,
                             ),
-                            do_local_insert,
                         },
                         chain_config.chain_id(),
                         chain_config.get_chain_revision(round),
@@ -553,7 +551,7 @@ where
                             match tx.secp256k1_recover() {
                                 Ok(signer) => rayon::iter::Either::Left((
                                     Recovered::new_unchecked(tx, signer),
-                                    PoolTransactionKind::Owned {
+                                    PoolTxKind::Owned {
                                         priority,
                                         extra_data,
                                     },
@@ -584,7 +582,7 @@ where
                     inserted_addresses.insert(tx.signer());
 
                     if tx.is_owned_and_forwardable() {
-                        immediately_forwardable_txs.push(tx.raw().tx().clone());
+                        immediately_forwardable_txs.push(tx.raw().clone_inner());
                     }
                 },
             );
@@ -623,7 +621,7 @@ where
                         match tx.secp256k1_recover() {
                             Ok(signer) => rayon::iter::Either::Left((
                                 Recovered::new_unchecked(tx, signer),
-                                PoolTransactionKind::Forwarded,
+                                PoolTxKind::Forwarded,
                             )),
                             Err(_) => rayon::iter::Either::Right((
                                 *tx.tx_hash(),

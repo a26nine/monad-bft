@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use alloy_consensus::Transaction as _;
+use alloy_consensus::{transaction::SignerRecoverable as _, Transaction as _};
 use futures::Stream;
 use monad_blocksync::messages::message::{
     BlockSyncBodyResponse, BlockSyncHeadersResponse, BlockSyncResponseMessage,
@@ -126,7 +126,10 @@ where
     fn exec(&mut self, commands: Vec<Self::Command>) {
         for command in commands {
             match command {
-                LedgerCommand::LedgerCommit(OptimisticCommit::Proposed(block)) => {
+                LedgerCommand::LedgerCommit(OptimisticCommit::Proposed {
+                    block,
+                    is_canonical: _,
+                }) => {
                     let _span = debug_span!("optimistic commit proposed").entered();
                     // generate eth block and update the state backend with committed nonces
                     let new_account_nonces = block
@@ -156,6 +159,12 @@ where
 
                     self.blocks.insert(block.get_id(), block);
                 }
+                LedgerCommand::LedgerCommit(OptimisticCommit::Voted(block)) => {
+                    let _span = debug_span!("optimistic commit voted").entered();
+                    // Voted blocks are already persisted from Proposed state.
+                    // Just ensure the block is in the cache.
+                    self.blocks.insert(block.get_id(), block);
+                }
                 LedgerCommand::LedgerCommit(OptimisticCommit::Finalized(block)) => {
                     let _span = debug_span!("optimistic commit finalized").entered();
                     self.finalized.insert(block.get_seq_num(), block.clone());
@@ -169,6 +178,9 @@ where
                             self.get_headers(block_range),
                         ),
                     });
+                    if let Some(waker) = self.waker.take() {
+                        waker.wake();
+                    }
                 }
                 LedgerCommand::LedgerFetchPayload(payload_id) => {
                     let _span = debug_span!("ledger fetch payload").entered();
@@ -177,6 +189,9 @@ where
                             self.get_payload(payload_id),
                         ),
                     });
+                    if let Some(waker) = self.waker.take() {
+                        waker.wake();
+                    }
                 }
             }
         }
@@ -200,7 +215,9 @@ where
             return Poll::Ready(Some(MonadEvent::BlockSyncEvent(event)));
         }
 
-        if this.waker.is_none() {
+        if let Some(waker) = this.waker.as_mut() {
+            waker.clone_from(cx.waker());
+        } else {
             this.waker = Some(cx.waker().clone());
         }
         Poll::Pending

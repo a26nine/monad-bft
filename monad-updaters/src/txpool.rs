@@ -18,7 +18,10 @@ use std::{
     task::{Poll, Waker},
 };
 
-use alloy_consensus::{transaction::Recovered, TxEnvelope};
+use alloy_consensus::{
+    transaction::{Recovered, SignerRecoverable},
+    TxEnvelope,
+};
 use alloy_rlp::Decodable;
 use bytes::Bytes;
 use futures::Stream;
@@ -34,7 +37,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_block_policy::EthBlockPolicy;
-use monad_eth_txpool::{EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTransactionKind};
+use monad_eth_txpool::{EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTxKind};
 use monad_eth_types::{EthExecutionProtocol, ExtractEthAddress};
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
@@ -457,10 +460,7 @@ where
                             .filter_map(|raw_tx| {
                                 let tx = TxEnvelope::decode(&mut raw_tx.as_ref()).ok()?;
                                 let signer = tx.recover_signer().ok()?;
-                                Some((
-                                    Recovered::new_unchecked(tx, signer),
-                                    PoolTransactionKind::Forwarded,
-                                ))
+                                Some((Recovered::new_unchecked(tx, signer), PoolTxKind::Forwarded))
                             })
                             .collect(),
                         |_| {},
@@ -503,7 +503,12 @@ where
             return Poll::Ready(Some(MonadEvent::MempoolEvent(event)));
         }
 
-        self.waker = Some(cx.waker().clone());
+        if let Some(waker) = self.waker.as_mut() {
+            waker.clone_from(cx.waker());
+        } else {
+            self.waker = Some(cx.waker().clone());
+        }
+
         Poll::Pending
     }
 }
@@ -602,7 +607,7 @@ where
             block_policy,
             state_backend,
             &MockChainConfig::DEFAULT,
-            vec![(tx, PoolTransactionKind::owned_default())],
+            vec![(tx, PoolTxKind::owned_default())],
             |tx| {
                 self.events.push_back(MempoolEvent::ForwardTxs(vec![
                     alloy_rlp::encode(tx.raw()).into()
