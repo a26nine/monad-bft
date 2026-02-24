@@ -45,7 +45,7 @@ use monad_crypto::certificate_signature::{
 use monad_eth_block_policy::{
     compute_txn_max_gas_cost,
     nonce_usage::{NonceUsage, NonceUsageMap},
-    pre_tfm_compute_max_txn_cost, timestamp_ns_to_secs,
+    timestamp_ns_to_secs,
     validation::static_validate_transaction,
     EthBlockPolicy, EthValidatedBlock,
 };
@@ -287,17 +287,11 @@ where
             ));
         }
 
-        if execution_chain_params.tfm_enabled {
-            if let Some(consensus_header_base_fee) = header.base_fee {
-                if consensus_header_base_fee != *base_fee_per_gas {
-                    return Err(HeaderError::InvalidBaseFee {
-                        consensus_header_base_fee,
-                        eth_header_base_fee: *base_fee_per_gas,
-                    });
-                }
-            } else {
-                return Err(HeaderError::EmptyHeaderBaseFee);
-            }
+        if header.base_fee != *base_fee_per_gas {
+            return Err(HeaderError::InvalidBaseFee {
+                consensus_header_base_fee: header.base_fee,
+                eth_header_base_fee: *base_fee_per_gas,
+            });
         }
 
         // Monad does not use request hashes yet
@@ -499,9 +493,7 @@ where
 
         let mut txn_fees: TxnFees = TxnFees::default();
         for eth_txn in validated_txns.iter() {
-            let block_base_fee = header
-                .base_fee
-                .unwrap_or(monad_tfm::base_fee::PRE_TFM_BASE_FEE);
+            let block_base_fee = header.base_fee;
             if eth_txn.max_fee_per_gas() < block_base_fee.into() {
                 debug!(
                     ?eth_txn,
@@ -560,7 +552,6 @@ where
                             first_txn_value: Balance::ZERO,
                             first_txn_gas: Balance::ZERO,
                             max_gas_cost: Balance::ZERO,
-                            max_txn_cost: Balance::ZERO,
                             is_delegated: true,
                             delegation_before_first_txn: true,
                         });
@@ -610,15 +601,11 @@ where
                     e.max_gas_cost = e
                         .max_gas_cost
                         .saturating_add(compute_txn_max_gas_cost(eth_txn, block_base_fee));
-                    e.max_txn_cost = e
-                        .max_txn_cost
-                        .saturating_add(pre_tfm_compute_max_txn_cost(eth_txn));
                 })
                 .or_insert(TxnFee {
                     first_txn_value: eth_txn.value(),
                     first_txn_gas: compute_txn_max_gas_cost(eth_txn, block_base_fee),
                     max_gas_cost: Balance::ZERO,
-                    max_txn_cost: pre_tfm_compute_max_txn_cost(eth_txn),
                     is_delegated: false,
                     delegation_before_first_txn: false,
                 });
@@ -683,9 +670,9 @@ mod test {
             GENESIS_SEQ_NUM + SeqNum(1),
             1,
             RoundSignature::new(Round(1), &nop_keypair),
-            Some(BASE_FEE as u64),
-            Some(BASE_FEE_TREND),
-            Some(BASE_FEE_MOMENT),
+            BASE_FEE as u64,
+            BASE_FEE_TREND,
+            BASE_FEE_MOMENT,
         )
     }
 
@@ -1438,9 +1425,9 @@ mod test {
             seq_num,
             timestamp_ns,
             round_signature,
-            Some(consensus_base_fee),
-            Some(BASE_FEE_TREND),
-            Some(BASE_FEE_MOMENT),
+            consensus_base_fee,
+            BASE_FEE_TREND,
+            BASE_FEE_MOMENT,
         );
 
         let result =
