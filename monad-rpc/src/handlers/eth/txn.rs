@@ -16,8 +16,8 @@
 use std::time::Duration;
 
 use alloy_consensus::{Transaction as _, TxEnvelope};
+use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, FixedBytes};
-use alloy_rlp::Decodable;
 use alloy_rpc_types::{Filter, TransactionReceipt};
 use monad_rpc_docs::rpc;
 use monad_triedb_utils::triedb_env::Triedb;
@@ -150,7 +150,7 @@ fn validate_and_decode_tx(
     allow_unprotected_txs: bool,
     decode_error_fn: impl FnOnce() -> JsonRpcError,
 ) -> Result<TxEnvelope, JsonRpcError> {
-    let tx = TxEnvelope::decode(&mut &hex_tx[..]).map_err(|err| {
+    let tx = TxEnvelope::decode_2718_exact(hex_tx).map_err(|err| {
         debug!(?err, "eth txn decode failed");
         decode_error_fn()
     })?;
@@ -416,7 +416,8 @@ mod tests {
     use alloy_rlp::Encodable;
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
-    use monad_triedb_utils::{mock_triedb::MockTriedb, triedb_env::Account};
+    use monad_eth_types::EthAccount;
+    use monad_triedb_utils::mock_triedb::MockTriedb;
 
     use super::{
         monad_eth_sendRawTransaction, monad_eth_sendRawTransactionSync,
@@ -467,7 +468,7 @@ mod tests {
 
         triedb.set_account(
             signer.address().0.into(),
-            Account {
+            EthAccount {
                 nonce: 10,
                 ..Default::default()
             },
@@ -510,7 +511,7 @@ mod tests {
 
         triedb.set_account(
             signer.address().0.into(),
-            Account {
+            EthAccount {
                 nonce: 10,
                 ..Default::default()
             },

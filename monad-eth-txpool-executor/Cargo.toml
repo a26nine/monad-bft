@@ -18,6 +18,8 @@ monad-eth-txpool-ipc = { workspace = true }
 monad-eth-txpool-types = { workspace = true }
 monad-eth-types = { workspace = true }
 monad-executor = { workspace = true }
+monad-fair-queue = { workspace = true }
+monad-peer-score = { workspace = true }
 monad-executor-glue = { workspace = true }
 monad-secp = { workspace = true }
 monad-state-backend = { workspace = true }
@@ -25,6 +27,7 @@ monad-types = { workspace = true }
 monad-validator = { workspace = true }
 
 alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 bytes = { workspace = true }

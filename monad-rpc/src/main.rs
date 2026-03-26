@@ -19,12 +19,15 @@ use actix_web::{web, App, HttpServer};
 use agent::AgentBuilder;
 use clap::Parser;
 use monad_archive::archive_reader::{redact_mongo_url, ArchiveReader};
-use monad_ethcall::EthCallExecutor;
-use monad_event_ring::EventRing;
+use monad_event_ring::{EventRing, EventRingPath};
 use monad_node_config::MonadNodeConfig;
 use monad_pprof::start_pprof_server;
 use monad_rpc::{
-    chainstate::{buffer::ChainStateBuffer, ChainState},
+    chainstate::{
+        buffer::ChainStateBuffer,
+        eth_call_handler::{EthCallHandler, EthCallHandlerConfig},
+        ChainState,
+    },
     comparator::RpcComparator,
     event::EventServer,
     handlers::{
@@ -37,7 +40,6 @@ use monad_rpc::{
 };
 use monad_tracing_timing::TimingsLayer;
 use monad_triedb_utils::triedb_env::TriedbEnv;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use tracing_actix_web::TracingLogger;
 use tracing_manytrace::{ManytraceLayer, TracingExtension};
@@ -120,11 +122,6 @@ async fn main() -> std::io::Result<()> {
             }
         });
     }
-
-    // initialize concurrent requests limiter
-    let concurrent_requests_limiter = Arc::new(Semaphore::new(
-        args.eth_call_max_concurrent_requests as usize,
-    ));
 
     MONAD_RPC_VERSION.map(|v| info!("starting monad-rpc with version {}", v));
 
@@ -264,35 +261,34 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let low_pool_config = monad_ethcall::PoolConfig {
-        num_threads: args.eth_call_executor_threads,
-        num_fibers: args.eth_call_executor_fibers,
-        timeout_sec: args.eth_call_executor_queuing_timeout,
-        queue_limit: args.eth_call_max_concurrent_requests,
-    };
-    let high_pool_config = monad_ethcall::PoolConfig {
-        num_threads: args.eth_call_high_executor_threads,
-        num_fibers: args.eth_call_high_executor_fibers,
-        timeout_sec: args.eth_call_high_executor_queuing_timeout,
-        queue_limit: args.eth_call_high_max_concurrent_requests,
-    };
-    let block_pool_config = monad_ethcall::PoolConfig {
-        num_threads: args.eth_trace_block_executor_threads,
-        num_fibers: args.eth_trace_block_executor_fibers,
-        timeout_sec: args.eth_trace_block_executor_queuing_timeout,
-        queue_limit: args.eth_trace_block_max_concurrent_requests,
-    };
-    let tx_exec_num_fibers = args.eth_trace_tx_executor_fibers;
-
-    let eth_call_executor = args.triedb_path.clone().as_deref().map(|path| {
-        Arc::new(EthCallExecutor::new(
-            low_pool_config,
-            high_pool_config,
-            block_pool_config,
-            tx_exec_num_fibers,
-            args.eth_call_executor_node_lru_max_mem,
-            path,
-        ))
+    let eth_call_handler = args.triedb_path.clone().as_deref().map(|triedb_path| {
+        EthCallHandler::new(
+            EthCallHandlerConfig {
+                enable_stats: args.enable_admin_eth_call_statistics,
+                pool_low: monad_ethcall::PoolConfig {
+                    num_threads: args.eth_call_executor_threads,
+                    num_fibers: args.eth_call_executor_fibers,
+                    timeout_sec: args.eth_call_executor_queuing_timeout,
+                    queue_limit: args.eth_call_max_concurrent_requests,
+                },
+                pool_high: monad_ethcall::PoolConfig {
+                    num_threads: args.eth_call_high_executor_threads,
+                    num_fibers: args.eth_call_high_executor_fibers,
+                    timeout_sec: args.eth_call_high_executor_queuing_timeout,
+                    queue_limit: args.eth_call_high_max_concurrent_requests,
+                },
+                pool_block: monad_ethcall::PoolConfig {
+                    num_threads: args.eth_trace_block_executor_threads,
+                    num_fibers: args.eth_trace_block_executor_fibers,
+                    timeout_sec: args.eth_trace_block_executor_queuing_timeout,
+                    queue_limit: args.eth_trace_block_max_concurrent_requests,
+                },
+                tx_exec_num_fibers: args.eth_trace_tx_executor_fibers,
+                node_cache_max_mem: args.eth_call_executor_node_lru_max_mem,
+                max_concurrent_permits: args.eth_call_max_concurrent_requests as usize,
+            },
+            triedb_path,
+        )
     });
 
     let with_metrics = args.otel_endpoint.map(|otel_endpoint| {
@@ -307,8 +303,10 @@ async fn main() -> std::io::Result<()> {
 
     // Configure event ring, websocket server and event cache.
     let (events_client, events_for_cache) = if let Some(exec_event_path) = args.exec_event_path {
-        let event_ring =
-            EventRing::new_from_path(exec_event_path).expect("Execution event ring is ready");
+        let event_ring_path =
+            EventRingPath::resolve(exec_event_path).expect("Execution event ring path resolves");
+
+        let event_ring = EventRing::new(event_ring_path).expect("Execution event ring is ready");
 
         let events_client = EventServer::start(event_ring);
 
@@ -353,9 +351,7 @@ async fn main() -> std::io::Result<()> {
         None
     };
 
-    let chain_state = triedb_env
-        .clone()
-        .map(|t| ChainState::new(event_buffer, t, archive_reader.clone()));
+    let chain_state = triedb_env.map(|t| ChainState::new(event_buffer, t, archive_reader));
 
     let rpc_comparator: Option<RpcComparator> = args
         .rpc_comparison_endpoint
@@ -364,17 +360,12 @@ async fn main() -> std::io::Result<()> {
 
     let app_state = MonadRpcResources::new(
         txpool_bridge_client,
-        triedb_env,
-        eth_call_executor,
-        args.eth_call_executor_fibers as usize,
-        archive_reader,
+        eth_call_handler,
         node_config.chain_id,
         chain_state,
         args.batch_request_limit,
         args.max_response_size,
         args.allow_unprotected_txs,
-        concurrent_requests_limiter,
-        args.eth_call_max_concurrent_requests as usize,
         args.eth_get_logs_max_block_range,
         args.eth_call_provider_gas_limit,
         args.eth_estimate_gas_provider_gas_limit,
@@ -383,7 +374,6 @@ async fn main() -> std::io::Result<()> {
         args.dry_run_get_logs_index,
         args.use_eth_get_logs_index,
         args.max_finalized_block_cache_len,
-        args.enable_admin_eth_call_statistics,
         with_metrics.clone(),
         rpc_comparator.clone(),
     );

@@ -1,0 +1,19 @@
+[package]
+name = "monad-fair-queue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+monad-dynamic-cap = { workspace = true }
+monad-executor = { workspace = true }
+monad-peer-score = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "queue_bench"
+harness = false

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["monad-*"]
-exclude = ["monad-execution", "monad-scripts"]
+exclude = ["monad-execution", "monad-scripts", "monad-fuzz"]
 
 [profile.dev]
 opt-level = 1
@@ -32,10 +32,12 @@ monad-consensus-types = { path = "./monad-consensus-types" }
 monad-control-panel = { path = "./monad-control-panel" }
 monad-crypto = { path = "./monad-crypto" }
 monad-dataplane = { path = "./monad-dataplane" }
+monad-dynamic-cap = { path = "./monad-dynamic-cap" }
 monad-eth-block-policy = { path = "./monad-eth-block-policy" }
 monad-eth-block-validator = { path = "./monad-eth-block-validator" }
 monad-eth-ledger = { path = "./monad-eth-ledger" }
 monad-eth-testutil = { path = "./monad-eth-testutil" }
+monad-fair-queue = { path = "./monad-fair-queue" }
 monad-eth-txpool = { path = "./monad-eth-txpool" }
 monad-eth-txpool-executor = { path = "./monad-eth-txpool-executor" }
 monad-eth-txpool-ipc = { path = "./monad-eth-txpool-ipc" }
@@ -45,6 +47,7 @@ monad-ethcall = { path = "./monad-ethcall" }
 monad-executor = { path = "./monad-executor" }
 monad-executor-glue = { path = "./monad-executor-glue" }
 monad-keystore = { path = "./monad-keystore" }
+monad-leanudp = { path = "./monad-leanudp" }
 monad-ledger = { path = "./monad-ledger" }
 monad-merkle = { path = "./monad-merkle" }
 monad-mock-swarm = { path = "./monad-mock-swarm" }
@@ -52,6 +55,7 @@ monad-multi-sig = { path = "./monad-multi-sig" }
 monad-node-config = { path = "./monad-node-config" }
 monad-peer-disc-swarm = { path = "./monad-peer-disc-swarm" }
 monad-peer-discovery = { path = "./monad-peer-discovery" }
+monad-peer-score = { path = "./monad-peer-score" }
 monad-perf-util = { path = "./monad-perf-util" }
 monad-pprof = { path = "./monad-pprof" }
 monad-raptor = { path = "./monad-raptor" }
@@ -101,7 +105,7 @@ alloy-network = "1.7"
 alloy-primitives = "1.5"
 alloy-rlp = { version = "0.3", features = ["arrayvec"] }
 alloy-rpc-client = "1.7"
-alloy-rpc-types = "1.7"
+alloy-rpc-types = { version = "1.7", default-features = false, features = ["eth"] }
 alloy-rpc-types-eth = "1.7"
 alloy-rpc-types-trace = "1.7"
 alloy-signer = "1.7"
@@ -109,7 +113,7 @@ alloy-signer-local = "1.7"
 alloy-sol-macro = "1.5"
 alloy-sol-types = "1.5"
 alloy-transport = "1.7"
-alloy-transport-http = "1.7"
+alloy-transport-http = { version = "1.7", default-features = false, features = ["reqwest", "reqwest-native-tls"] }
 arbitrary = "1.4.1"
 arrayvec = { version = "0.7", features = ["serde"] }
 as-any = "0.3.1"
@@ -118,16 +122,16 @@ async-graphql = "7.0"
 async-stream = "0.3.6"
 auto_impl = "1.2"
 awc = "3"
-aws-sdk-s3 = "1.122.0"
+aws-sdk-s3 = { version = "1.122.0", default-features = false, features = ["behavior-version-latest", "sigv4a", "rt-tokio", "default-https-client"] }
 aws-config = "1.8.13"
-aws-sdk-dynamodb = "1.104.0"
+aws-sdk-dynamodb = { version = "1.104.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 base64 = "0.22.1"
 bincode = "1.3"
 bindgen = "0.71.1"
 bitvec = "1.0"
 blake3 = "1.5"
 blst = "0.3.15"
-brotli = "3.4"
+brotli = "8"
 byte-unit = "5.1"
 bytes = "1.5"
 chrono = "0.4.34"
@@ -158,18 +162,18 @@ inotify = "0.11"
 k256 = { version = "0.13", features = ["hash2curve"] }
 inventory = "0.3"
 iset = "0.3.1"
-itertools = "0.10"
-jemalloc_pprof = "0.8.1"
+itertools = "0.13"
+jemalloc_pprof = "0.8"
 libc = "0.2.153"
 lru = "0.16"
 lz4 = "1.28"
-mongodb = "3.2.1"
+mongodb = { version = "3.2.1", default-features = false, features = ["compat-3-0-0", "dns-resolver", "openssl-tls"] }
 monoio = { git = "https://github.com/category-labs/monoio.git", tag = "0.2.4-category", features = ["sync", "iouring"] }
 ntest = "0.9"
 once_cell = "1.19.0"
-opentelemetry = "0.29"
-opentelemetry_sdk = "0.29"
-opentelemetry-otlp = "0.29"
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+opentelemetry-otlp = "0.31"
 opentelemetry-semantic-conventions = "0.29"
 pbkdf2 = "0.12"
 peak_alloc = "0.2"
@@ -200,7 +204,7 @@ simple-xml-builder = "1.1"
 socket2 = "0.5.9"
 sorted_vector_map = "0.2.0"
 sorted-vec = "0.8.3"
-strum = "0.26.3"
+strum = "0.27"
 syn = { version = "1.0.0", features = ["full"] }
 tempfile = "3.5"
 test-case = "3.0"
@@ -217,7 +221,7 @@ tracing = "0.1"
 tracing-actix-web = "0.7"
 tracing-manytrace = { git = "https://github.com/category-labs/manytrace.git", tag = "v0.1.1" }
 tracing-appender = "0.2"
-tracing-opentelemetry = "0.30"
+tracing-opentelemetry = "0.32"
 tracing-subscriber = "0.3"
 tracing-test = "0.2"
 unicode-normalization = "0.1"

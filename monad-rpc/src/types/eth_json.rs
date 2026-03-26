@@ -16,6 +16,7 @@
 use std::str::FromStr;
 
 use alloy_consensus::TxEnvelope;
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, FixedBytes, LogData, U256};
 use alloy_rpc_types::{
     pubsub::Params, Block, FeeHistory, Header, Log, Transaction, TransactionReceipt,
@@ -27,7 +28,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 use tracing::debug;
 
-use crate::types::{ethhex, jsonrpc::JsonRpcError};
+use crate::{
+    handlers::eth::call::CallRequest,
+    types::{ethhex, jsonrpc::JsonRpcError},
+};
 
 pub type EthAddress = FixedData<20>;
 pub type EthHash = FixedData<32>;
@@ -98,6 +102,30 @@ fn schema_for_block(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema:
     schemars::schema_for_value!(Block::<Transaction<TxEnvelope>, Header>::default())
         .schema
         .into()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillTransactionResult {
+    /// RLP-encoded unsigned transaction
+    pub raw: UnformattedData,
+    /// The filled transaction object
+    pub tx: CallRequest,
+}
+
+impl schemars::JsonSchema for FillTransactionResult {
+    fn schema_name() -> String {
+        "FillTransactionResult".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema_for_value!(FillTransactionResult {
+            raw: UnformattedData(vec![]),
+            tx: CallRequest::default(),
+        })
+        .schema
+        .into()
+    }
 }
 
 #[derive(Serialize, Debug, JsonSchema)]
@@ -317,6 +345,18 @@ impl FromStr for BlockTags {
     }
 }
 
+impl From<BlockNumberOrTag> for BlockTags {
+    fn from(value: BlockNumberOrTag) -> Self {
+        match value {
+            BlockNumberOrTag::Number(number) => Self::Number(Quantity(number)),
+            BlockNumberOrTag::Earliest => Self::Number(Quantity(0)),
+            BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => Self::Latest,
+            BlockNumberOrTag::Safe => Self::Safe,
+            BlockNumberOrTag::Finalized => Self::Finalized,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for BlockTags {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -466,6 +506,7 @@ pub fn serialize_result<T: Serialize>(value: T) -> Result<Box<RawValue>, JsonRpc
 
 #[cfg(test)]
 mod tests {
+    use alloy_eips::BlockNumberOrTag;
     use alloy_primitives::U256;
     use serde::Deserialize;
     use serde_json::json;
@@ -559,6 +600,28 @@ mod tests {
 
         let x: OneBlockParam = serde_json::from_value(json!(["0xffacb0"])).unwrap();
         assert_eq!(BlockTags::Number(Quantity(16755888)), x.a);
+    }
+
+    #[test]
+    fn test_block_number_or_tag_into_block_tags() {
+        assert_eq!(
+            BlockTags::Number(Quantity(7)),
+            BlockTags::from(BlockNumberOrTag::Number(7))
+        );
+        assert_eq!(
+            BlockTags::Number(Quantity(0)),
+            BlockTags::from(BlockNumberOrTag::Earliest)
+        );
+        assert_eq!(BlockTags::Latest, BlockTags::from(BlockNumberOrTag::Latest));
+        assert_eq!(
+            BlockTags::Latest,
+            BlockTags::from(BlockNumberOrTag::Pending)
+        );
+        assert_eq!(BlockTags::Safe, BlockTags::from(BlockNumberOrTag::Safe));
+        assert_eq!(
+            BlockTags::Finalized,
+            BlockTags::from(BlockNumberOrTag::Finalized)
+        );
     }
 
     #[derive(Deserialize, Debug)]

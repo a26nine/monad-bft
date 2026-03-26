@@ -194,7 +194,8 @@ where
             validator_sets: vec![LockedEpoch {
                 epoch: Epoch(1),
                 round: GENESIS_ROUND,
-            }],
+            }]
+            .into(),
         }
         .into()
     }
@@ -688,25 +689,26 @@ where
         let mut payload = Header::decode_bytes(buf, true)?;
         let _monad_version = MonadVersion::decode(&mut payload)?;
 
-        match u8::decode(&mut payload)? {
-            1 => Ok(Self::Consensus(Unverified::<
-                ST,
-                Unvalidated<ConsensusMessage<ST, SCT, EPT>>,
-            >::decode(&mut payload)?)),
-            2 => Ok(Self::BlockSyncRequest(BlockSyncRequestMessage::decode(
-                &mut payload,
-            )?)),
-            3 => Ok(Self::BlockSyncResponse(BlockSyncResponseMessage::decode(
-                &mut payload,
-            )?)),
-            4 => Ok(Self::ForwardedTx(Vec::<Bytes>::decode(&mut payload)?)),
-            5 => Ok(Self::StateSyncMessage(StateSyncNetworkMessage::decode(
-                &mut payload,
-            )?)),
-            _ => Err(alloy_rlp::Error::Custom(
-                "failed to decode unknown MonadMessage",
-            )),
+        let result = match u8::decode(&mut payload)? {
+            1 => Self::Consensus(
+                Unverified::<ST, Unvalidated<ConsensusMessage<ST, SCT, EPT>>>::decode(
+                    &mut payload,
+                )?,
+            ),
+            2 => Self::BlockSyncRequest(BlockSyncRequestMessage::decode(&mut payload)?),
+            3 => Self::BlockSyncResponse(BlockSyncResponseMessage::decode(&mut payload)?),
+            4 => Self::ForwardedTx(Vec::<Bytes>::decode(&mut payload)?),
+            5 => Self::StateSyncMessage(StateSyncNetworkMessage::decode(&mut payload)?),
+            _ => {
+                return Err(alloy_rlp::Error::Custom(
+                    "failed to decode unknown MonadMessage",
+                ))
+            }
+        };
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
         }
+        Ok(result)
     }
 }
 
@@ -1156,7 +1158,15 @@ where
                     else {
                         unreachable!("DoneSync invoked while ConsensusState is live")
                     };
-                    assert_eq!(db_status, &DbSyncStatus::Started);
+
+                    // db_status will almost always be DbSyncStatus::Started
+                    //
+                    // db_status can be DbSyncStatus::Waiting if the statesync target is reset and
+                    // the old target returns DoneSync before the new RequestSync is emitted
+                    assert!(matches!(
+                        db_status,
+                        DbSyncStatus::Waiting | DbSyncStatus::Started
+                    ));
 
                     let delay = self.consensus_config.execution_delay;
                     let maybe_target = block_buffer
@@ -1165,6 +1175,7 @@ where
                     match maybe_target {
                         Some(target) if n >= target => {
                             assert_eq!(n, target);
+                            assert_eq!(db_status, &DbSyncStatus::Started);
 
                             tracing::info!(?target, ?n, "done db statesync");
                             *db_status = DbSyncStatus::Done;
@@ -1247,6 +1258,9 @@ where
             },
             MonadEvent::TimestampUpdateEvent(t) => {
                 self.block_timestamp.update_time(t);
+                if let ConsensusMode::Live(consensus) = &mut self.consensus {
+                    consensus.refresh_vote_delay_metrics(t, &mut self.metrics);
+                }
                 vec![]
             }
             MonadEvent::ConfigEvent(config_event) => match config_event {
@@ -1679,7 +1693,8 @@ mod test {
                     epoch: Epoch(4),
                     round: Round(4050),
                 },
-            ],
+            ]
+            .into(),
         }
         .into();
 
@@ -1831,11 +1846,14 @@ mod test {
         >(1, ValidatorSetFactory::default());
 
         let make_val_set_data = |stake: Stake| {
-            ValidatorSetData(vec![ValidatorData {
-                node_id: NodeId::new(keys[0].pubkey()),
-                cert_pubkey: cert_keys[0].pubkey(),
-                stake,
-            }])
+            ValidatorSetData(
+                vec![ValidatorData {
+                    node_id: NodeId::new(keys[0].pubkey()),
+                    cert_pubkey: cert_keys[0].pubkey(),
+                    stake,
+                }]
+                .into(),
+            )
         };
 
         let validators_config: ValidatorsConfig<SignatureCollectionType> = ValidatorsConfig {

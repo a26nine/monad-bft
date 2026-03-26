@@ -62,8 +62,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, debug_span, error, trace, warn};
 use udp::GroupId;
 use util::{
-    BuildTarget, Collector, Group, PeerAddrLookup, ReBroadcastGroupMap, Recipient, Redundancy,
-    UdpMessage,
+    BuildTarget, Collector, FullNodeGroupMap, PeerAddrLookup, Recipient, Redundancy,
+    SecondaryGroupAssignment, UdpMessage,
 };
 
 use crate::{
@@ -108,7 +108,7 @@ where
     is_dynamic_fullnode: bool,
 
     epoch_validators: BTreeMap<Epoch, ValidatorSet<CertificateSignaturePubKey<ST>>>,
-    rebroadcast_map: ReBroadcastGroupMap<CertificateSignaturePubKey<ST>>,
+    full_node_groups: FullNodeGroupMap<CertificateSignaturePubKey<ST>>,
 
     dedicated_full_nodes: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
     peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
@@ -126,7 +126,8 @@ where
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
     channel_to_secondary: Option<UnboundedSender<FullNodesGroupMessage<ST>>>,
-    channel_from_secondary: Option<UnboundedReceiver<Group<CertificateSignaturePubKey<ST>>>>,
+    channel_from_secondary:
+        Option<UnboundedReceiver<SecondaryGroupAssignment<CertificateSignaturePubKey<ST>>>>,
     channel_from_secondary_outbound:
         Option<UnboundedReceiver<SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>>>,
 
@@ -176,6 +177,22 @@ where
                 config.primary_instance.raptor10_redundancy
             );
         }
+
+        if config
+            .secondary_instance
+            .raptor10_fullnode_redundancy_factor
+            > udp::MAX_REDUNDANCY.to_f32()
+        {
+            panic!(
+                "Configuration value raptor10_fullnode_redundancy_factor must be at most {}, \
+                but got {}.",
+                udp::MAX_REDUNDANCY.to_f32(),
+                config
+                    .secondary_instance
+                    .raptor10_fullnode_redundancy_factor
+            );
+        }
+
         let self_id = NodeId::new(config.shared_key.pubkey());
         let is_dynamic_fullnode = matches!(secondary_mode, SecondaryRaptorCastModeConfig::Client);
         debug!(
@@ -210,7 +227,8 @@ where
         Self {
             is_dynamic_fullnode,
             epoch_validators: Default::default(),
-            rebroadcast_map: ReBroadcastGroupMap::new(self_id),
+            full_node_groups: Default::default(),
+
             dedicated_full_nodes: config.primary_instance.fullnode_dedicated.clone(),
             peer_discovery_driver,
 
@@ -255,7 +273,9 @@ where
         &mut self,
         role: SecondaryRaptorCastModeConfig,
         channel_to_secondary: UnboundedSender<FullNodesGroupMessage<ST>>,
-        channel_from_secondary: UnboundedReceiver<Group<CertificateSignaturePubKey<ST>>>,
+        channel_from_secondary: UnboundedReceiver<
+            SecondaryGroupAssignment<CertificateSignaturePubKey<ST>>,
+        >,
         channel_from_secondary_outbound: UnboundedReceiver<
             SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
         >,
@@ -284,8 +304,9 @@ where
         self.dedicated_full_nodes = nodes;
     }
 
-    pub fn get_rebroadcast_groups(&self) -> &ReBroadcastGroupMap<CertificateSignaturePubKey<ST>> {
-        &self.rebroadcast_map
+    // Used only in tests
+    pub fn get_full_node_groups(&self) -> &FullNodeGroupMap<CertificateSignaturePubKey<ST>> {
+        &self.full_node_groups
     }
 
     pub fn is_connected_to(
@@ -463,7 +484,9 @@ where
                     .unwrap_log_on_error(&outbound_message, &build_target);
             }
 
-            RouterTarget::PointToPoint(to) if to == self_id => {
+            RouterTarget::PointToPoint(to) | RouterTarget::DirectPointToPoint(to)
+                if to == self_id =>
+            {
                 Self::enqueue_message_to_self(
                     message,
                     &mut self.pending_events,
@@ -472,7 +495,7 @@ where
                 );
             }
 
-            RouterTarget::PointToPoint(to) => {
+            RouterTarget::PointToPoint(to) | RouterTarget::DirectPointToPoint(to) => {
                 let outbound_message =
                     match OutboundRouterMessage::<OM, ST>::AppMessage(message).try_serialize() {
                         Ok(msg) => msg,
@@ -747,15 +770,9 @@ where
                             secondary_mb.set_group_id(GroupId::Primary(epoch));
                         }
 
-                        while let Some(entry) = self.epoch_validators.first_entry() {
-                            if *entry.key() + Epoch(1) < self.current_epoch {
-                                entry.remove();
-                            } else {
-                                break;
-                            }
-                        }
+                        self.epoch_validators.retain(|e, _| *e + Epoch(1) >= epoch);
                     }
-                    self.rebroadcast_map.delete_expired_groups(epoch, round);
+                    self.full_node_groups.delete_expired(round);
                     self.peer_discovery_driver
                         .lock()
                         .unwrap()
@@ -766,8 +783,6 @@ where
                     validator_set,
                 } => {
                     trace!(?epoch, ?validator_set, "RaptorCast AddEpochValidatorSet");
-                    self.rebroadcast_map
-                        .push_group_validator_set(validator_set.clone(), epoch);
                     if let Some(epoch_validators) = self.epoch_validators.get(&epoch) {
                         assert_eq!(validator_set.len(), epoch_validators.len());
 
@@ -1004,8 +1019,8 @@ where
             let src_addr = message.src_addr;
             let decoded_app_messages = {
                 this.udp_state.handle_message(
-                    &this.rebroadcast_map,
                     &this.epoch_validators,
+                    &this.full_node_groups,
                     |targets, payload, bcast_stride| {
                         for target in targets {
                             rebroadcast_packet(
@@ -1262,7 +1277,16 @@ where
             loop {
                 match pin!(channel_from_secondary.recv()).poll(cx) {
                     Poll::Ready(Some(group)) => {
-                        this.rebroadcast_map.push_group_fullnodes(group);
+                        let round_span = *group.round_span(); // for logging only
+                        let publisher_id = *group.publisher_id();
+                        if this.full_node_groups.try_insert(group).is_none() {
+                            // TODO: convert to an assertion?
+                            error!(
+                                round_span =? round_span,
+                                publisher_id =? publisher_id,
+                                "Accepted group assignment contains overlaps"
+                            );
+                        };
                     }
                     Poll::Ready(None) => {
                         error!("RaptorCast secondary->primary channel disconnected.");

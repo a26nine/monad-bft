@@ -582,7 +582,9 @@ where
             );
             return;
         }
-        if !self.full_nodes_candidates.contains(&candidate) {
+        let end = self.full_nodes_candidates.len().min(self.num_invites_sent);
+        let invited = &self.full_nodes_candidates[..end];
+        if !invited.contains(&candidate) {
             warn!(
                 ?candidate,
                 ?self,
@@ -646,7 +648,7 @@ mod tests {
     use iset::{interval_map, IntervalMap};
     use monad_secp::SecpSignature;
     use monad_testutil::signing::get_key;
-    use monad_types::{Epoch, Round};
+    use monad_types::Round;
     use rand::SeedableRng;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
     use tracing_subscriber::fmt::format::FmtSpan;
@@ -655,7 +657,7 @@ mod tests {
         super::{
             super::{
                 config::RaptorCastConfigSecondaryClient,
-                util::{Group, ReBroadcastGroupMap},
+                util::{FullNodeGroupMap, SecondaryGroupAssignment},
             },
             group_message::PrepareGroupResponse,
             Client,
@@ -666,8 +668,8 @@ mod tests {
     type ST = SecpSignature;
     type PubKeyType = CertificateSignaturePubKey<ST>;
     type RcToRcChannelGrp = (
-        UnboundedSender<Group<PubKeyType>>,
-        UnboundedReceiver<Group<PubKeyType>>,
+        UnboundedSender<SecondaryGroupAssignment<PubKeyType>>,
+        UnboundedReceiver<SecondaryGroupAssignment<PubKeyType>>,
     );
     type NodeIdST<ST> = NodeId<CertificateSignaturePubKey<ST>>;
 
@@ -1041,37 +1043,39 @@ mod tests {
     // This is a mock of how the primary raptorcast instance would represent
     // the rebroadcast group map.
     struct MockGroupMap {
-        rx_from_client: UnboundedReceiver<Group<PubKeyType>>,
-        group_map: ReBroadcastGroupMap<PubKeyType>,
+        rx_from_client: UnboundedReceiver<SecondaryGroupAssignment<PubKeyType>>,
+        group_map: FullNodeGroupMap<PubKeyType>,
     }
     impl MockGroupMap {
         fn new(
-            clt_node_id: NodeId<PubKeyType>,
-            rx_from_client: UnboundedReceiver<Group<PubKeyType>>,
+            _clt_node_id: NodeId<PubKeyType>,
+            rx_from_client: UnboundedReceiver<SecondaryGroupAssignment<PubKeyType>>,
         ) -> Self {
             Self {
-                group_map: ReBroadcastGroupMap::new(clt_node_id),
+                group_map: FullNodeGroupMap::default(),
                 rx_from_client,
             }
         }
 
         fn update(&mut self, clt: &Client<ST>) {
             let curr_round = clt.get_curr_round();
-            self.group_map.delete_expired_groups(Epoch(0), curr_round);
+            self.group_map.delete_expired(curr_round);
             while let Ok(group) = self.rx_from_client.try_recv() {
                 println!("Received group: {:?}", group);
                 println!(
-                    "   Other Peers: {:?}",
-                    nid_list_str(group.get_other_peers())
+                    "   Peers: {:?}",
+                    nid_list_str(&group.group().iter().cloned().collect())
                 );
-                self.group_map.push_group_fullnodes(group);
+                self.group_map
+                    .try_insert(group)
+                    .expect("non-overlapping round span");
             }
-            self.group_map.delete_expired_groups(Epoch(0), curr_round);
+            self.group_map.delete_expired(curr_round);
         }
 
         fn is_empty(&mut self, clt: &Client<ST>) -> bool {
             self.update(clt);
-            self.group_map.get_fullnode_map().is_empty()
+            self.group_map.is_empty()
         }
 
         fn get_rc_group_peers(
@@ -1080,13 +1084,14 @@ mod tests {
             validator_id: &NodeIdST<ST>,
         ) -> Vec<NodeIdST<ST>> {
             self.update(clt);
-            let fn_group_map = self.group_map.get_fullnode_map();
-            let Some(group) = fn_group_map.get(validator_id) else {
+            let Some(group_map) = self.group_map.get_group_map(validator_id) else {
                 return Vec::new();
             };
-            let mut group_incl_self = group.get_other_peers().clone();
-            group_incl_self.push(clt.get_client_node_id());
-            group_incl_self
+            let curr_round = clt.get_curr_round();
+            let Some(group) = group_map.get_current_or_next(curr_round) else {
+                return Vec::new();
+            };
+            group.iter().cloned().collect()
         }
     }
 
@@ -2205,6 +2210,49 @@ mod tests {
                 dump_pub_sched(&v0_fsm)
             );
         }
+    }
+
+    #[test]
+    fn uninvited_candidate_rejected() {
+        let sched_cfg = GroupSchedulingConfig {
+            max_group_size: 3,
+            round_span: Round(5),
+            invite_lookahead: Round(8),
+            max_invite_wait: Round(2),
+            deadline_round_dist: Round(3),
+            init_empty_round_span: Round(7),
+        };
+
+        let mut v0_fsm: Publisher<ST> = Publisher::new(
+            nid(0),
+            RaptorCastConfigSecondaryPublisher {
+                full_nodes_prioritized: vec![nid(10), nid(11)],
+                group_scheduling: sched_cfg,
+            },
+            ChaCha8Rng::seed_from_u64(42),
+        );
+
+        v0_fsm.upsert_peer_disc_full_nodes(vec![nid(12), nid(13), nid(14), nid(15)]);
+
+        // Send invitation to 3 nodes (2 prioritized + 1 from peer disc)
+        let (_group_msg, invitees) = v0_fsm
+            .enter_round_and_step_until(Round(1))
+            .expect("should send invites");
+        assert_eq!(invitees, node_ids_vec![10, 11, 12]);
+
+        // Get the scheduled group to inspect its full state
+        let start_round = Round(8);
+        let group = v0_fsm.group_schedule.get(&start_round).unwrap();
+
+        // The uninvited node sends a PrepareGroupResponse(accept=true).
+        let uninvited_node = nid(14); // nid(14) was not in invitees
+        let attacker_response =
+            make_invite_response(nid(0), uninvited_node, true, start_round, &sched_cfg);
+        v0_fsm.on_candidate_response(attacker_response);
+
+        // Verify the uninvited node was not accepted into the group
+        let group = v0_fsm.group_schedule.get(&start_round).unwrap();
+        assert!(!group.full_nodes_accepted.contains(&uninvited_node));
     }
 
     // cargo test -p monad-raptorcast raptorcast_secondary::tests::reject_and_accept_counter -- --nocapture

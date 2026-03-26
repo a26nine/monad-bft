@@ -134,19 +134,13 @@ impl FromStr for Round {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+// A non-empty span of rounds
 pub struct RoundSpan {
     pub start: Round, // inclusive
     pub end: Round,   // exclusive
 }
 
 impl RoundSpan {
-    // TODO: The empty RoundSpan is only used in the Group struct
-    // representing a validator set. Remove this exception after we
-    // refactor out the Group struct.
-    pub fn empty(at: Round) -> Self {
-        Self { start: at, end: at }
-    }
-
     pub fn new(start: Round, end: Round) -> Option<Self> {
         if start >= end {
             return None;
@@ -169,6 +163,12 @@ impl RoundSpan {
     }
     pub fn overlaps(&self, other: &RoundSpan) -> bool {
         self.start < other.end && other.start < self.end
+    }
+}
+
+impl From<RoundSpan> for std::ops::Range<Round> {
+    fn from(span: RoundSpan) -> Self {
+        span.start..span.end
     }
 }
 
@@ -659,6 +659,7 @@ pub enum RouterTarget<P: PubKey> {
     Broadcast(Epoch),
     Raptorcast(Epoch), // sharded raptor-aware broadcast
     PointToPoint(NodeId<P>),
+    DirectPointToPoint(NodeId<P>),
     TcpPointToPoint {
         to: NodeId<P>,
         completion: Option<futures::channel::oneshot::Sender<()>>,
@@ -859,6 +860,33 @@ impl<T, const N: usize> std::ops::DerefMut for LimitedVec<T, N> {
 impl<T, const N: usize> From<Vec<T>> for LimitedVec<T, N> {
     fn from(vec: Vec<T>) -> Self {
         Self(vec)
+    }
+}
+
+impl<T: Serialize, const N: usize> Serialize for LimitedVec<T, N> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for LimitedVec<T, N> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<T>::deserialize(deserializer).map(Self)
+    }
+}
+
+impl<T, const N: usize> FromIterator<T> for LimitedVec<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl<'a, T, const N: usize> IntoIterator for &'a LimitedVec<T, N> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 

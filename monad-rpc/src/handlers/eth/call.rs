@@ -16,11 +16,6 @@
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
 };
 
 use alloy_consensus::{Header, SignableTransaction, TxEip1559, TxEip7702, TxEnvelope, TxLegacy};
@@ -37,108 +32,20 @@ use monad_types::{BlockId, Hash, SeqNum};
 use serde::{Deserialize, Serialize};
 use serde_cbor;
 use serde_json::value::RawValue;
-use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 use crate::{
-    chainstate::get_block_key_from_tag_or_hash,
+    chainstate::{
+        eth_call_handler::{EthCallHandlerConfig, EthCallStatsTracker},
+        get_block_key_from_tag_or_hash, ChainState,
+    },
     handlers::debug::{decode_call_frame, Tracer, TracerObject},
-    middleware::TimingRequestId,
     types::{
         eth_json::BlockTagOrHash,
         ethhex,
         jsonrpc::{JsonRpcError, JsonRpcResult},
     },
 };
-
-#[derive(Debug)]
-struct EthCallRequestStats {
-    entry_time: Instant,
-}
-
-#[derive(Debug)]
-struct CumulativeStats {
-    total_requests: AtomicU64,
-    total_errors: AtomicU64,
-    queue_rejections: AtomicU64,
-}
-
-impl Default for CumulativeStats {
-    fn default() -> Self {
-        Self {
-            total_requests: AtomicU64::new(0),
-            total_errors: AtomicU64::new(0),
-            queue_rejections: AtomicU64::new(0),
-        }
-    }
-}
-
-impl Clone for CumulativeStats {
-    fn clone(&self) -> Self {
-        Self {
-            total_requests: AtomicU64::new(self.total_requests.load(Ordering::Relaxed)),
-            total_errors: AtomicU64::new(self.total_errors.load(Ordering::Relaxed)),
-            queue_rejections: AtomicU64::new(self.queue_rejections.load(Ordering::Relaxed)),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct EthCallStatsTracker {
-    active_requests: Arc<Mutex<HashMap<TimingRequestId, EthCallRequestStats>>>,
-    stats: CumulativeStats,
-}
-
-impl EthCallStatsTracker {
-    pub async fn record_request_start(&self, request_id: TimingRequestId) {
-        let mut requests = self.active_requests.lock().await;
-        requests.insert(
-            request_id,
-            EthCallRequestStats {
-                entry_time: Instant::now(),
-            },
-        );
-
-        self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub async fn record_request_complete(&self, request_id: &TimingRequestId, is_error: bool) {
-        let mut requests = self.active_requests.lock().await;
-        requests.remove(request_id);
-
-        if is_error {
-            self.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub async fn record_queue_rejection(&self) {
-        self.stats.queue_rejections.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    async fn get_stats(&self) -> (Option<Duration>, Option<Duration>, CumulativeStats) {
-        let requests = self.active_requests.lock().await;
-
-        if requests.is_empty() {
-            return (None, None, self.stats.clone());
-        }
-
-        let now = Instant::now();
-        let mut max_age = Duration::ZERO;
-        let mut total_age = Duration::ZERO;
-
-        for stats in requests.values() {
-            let age = now - stats.entry_time;
-            max_age = max_age.max(age);
-            total_age += age;
-        }
-
-        let avg_age = total_age / requests.len() as u32;
-
-        (Some(max_age), Some(avg_age), self.stats.clone())
-    }
-}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -658,7 +565,7 @@ impl CallParams {
 #[tracing::instrument(level = "debug")]
 pub async fn prepare_eth_call<T: Triedb + TriedbPath>(
     triedb_env: &T,
-    eth_call_executor: Arc<EthCallExecutor>,
+    eth_call_executor: &EthCallExecutor,
     chain_id: u64,
     eth_call_provider_gas_limit: u64,
     mut params: CallParams,
@@ -773,14 +680,14 @@ pub async fn prepare_eth_call<T: Triedb + TriedbPath>(
 }
 
 /// Executes a new message call immediately without creating a transaction on the block chain.
-#[tracing::instrument(level = "debug")]
+#[tracing::instrument(level = "debug", skip(chain_state))]
 #[rpc(
     method = "eth_call",
     ignore = "eth_call_executor,chain_id,eth_call_provider_gas_limit"
 )]
 pub async fn monad_eth_call<T: Triedb + TriedbPath>(
-    triedb_env: &T,
-    eth_call_executor: Arc<EthCallExecutor>,
+    chain_state: &ChainState<T>,
+    eth_call_executor: &EthCallExecutor,
     chain_id: u64,
     eth_call_provider_gas_limit: u64,
     params: MonadEthCallParams,
@@ -788,7 +695,7 @@ pub async fn monad_eth_call<T: Triedb + TriedbPath>(
     trace!("monad_eth_call: {params:?}");
 
     match prepare_eth_call(
-        triedb_env,
+        &chain_state.triedb_env,
         eth_call_executor,
         chain_id,
         eth_call_provider_gas_limit,
@@ -815,22 +722,22 @@ pub async fn monad_eth_call<T: Triedb + TriedbPath>(
 )]
 #[allow(non_snake_case)]
 pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
-    triedb_env: &T,
-    eth_call_executor: Arc<EthCallExecutor>,
+    chain_state: &ChainState<T>,
+    eth_call_executor: &EthCallExecutor,
     chain_id: u64,
     eth_call_gas_limit: u64,
     params: MonadDebugTraceCallParams,
 ) -> JsonRpcResult<Box<RawValue>> {
     debug!(?params, "monad_debug_traceCall");
 
-    let block_key = get_block_key_from_tag_or_hash(triedb_env, params.block.clone())
+    let block_key = get_block_key_from_tag_or_hash(&chain_state.triedb_env, params.block.clone())
         .await
         .ok_or_else(JsonRpcError::block_not_found)?;
 
     let tracer = CallParams::Trace(params.clone()).monad_tracer();
 
     let raw_payload: Vec<u8> = match prepare_eth_call(
-        triedb_env,
+        &chain_state.triedb_env,
         eth_call_executor,
         chain_id,
         eth_call_gas_limit,
@@ -849,7 +756,7 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
         MonadTracer::CallTracer => {
             let mut slice: &[u8] = raw_payload.as_slice();
             let frame = decode_call_frame(
-                triedb_env,
+                &chain_state.triedb_env,
                 &mut slice,
                 block_key,
                 &params.tracer.tracer_params,
@@ -883,8 +790,8 @@ pub async fn monad_debug_traceCall<T: Triedb + TriedbPath>(
 )]
 #[allow(non_snake_case)]
 pub async fn monad_createAccessList<T: Triedb + TriedbPath>(
-    triedb_env: &T,
-    eth_call_executor: Arc<EthCallExecutor>,
+    chain_state: &ChainState<T>,
+    eth_call_executor: &EthCallExecutor,
     chain_id: u64,
     eth_call_gas_limit: u64,
     params: MonadCreateAccessListParams,
@@ -892,8 +799,8 @@ pub async fn monad_createAccessList<T: Triedb + TriedbPath>(
     trace!("monad_createAccessList: {params:?}");
 
     let raw_payload: Vec<u8> = match prepare_eth_call(
-        triedb_env,
-        eth_call_executor.clone(),
+        &chain_state.triedb_env,
+        eth_call_executor,
         chain_id,
         eth_call_gas_limit,
         CallParams::AccessList(params.clone()),
@@ -936,7 +843,7 @@ pub async fn monad_createAccessList<T: Triedb + TriedbPath>(
     };
 
     let result: AccessListResult = match prepare_eth_call(
-        triedb_env,
+        &chain_state.triedb_env,
         eth_call_executor,
         chain_id,
         eth_call_gas_limit,
@@ -983,29 +890,30 @@ pub struct EthCallCapacityStats {
 #[tracing::instrument(level = "debug")]
 #[monad_rpc_docs::rpc(
     method = "admin_ethCallStatistics",
-    ignore = "eth_call_executor_fibers,total_permits,available_permits"
+    ignore = "config,available_permits"
 )]
 pub async fn monad_admin_ethCallStatistics(
-    eth_call_executor_fibers: usize,
-    total_permits: usize,
+    config: &EthCallHandlerConfig,
     available_permits: usize,
     stats_tracker: &EthCallStatsTracker,
 ) -> JsonRpcResult<EthCallCapacityStats> {
-    let active_requests = total_permits - available_permits;
+    let active_requests = config.max_concurrent_permits - available_permits;
+    let executor_fibers = config.pool_low.num_fibers as usize;
 
-    let inactive_executors = eth_call_executor_fibers.saturating_sub(active_requests);
+    let inactive_executors = executor_fibers.saturating_sub(active_requests);
 
-    let queued_requests = active_requests.saturating_sub(eth_call_executor_fibers);
-    let (max_age, avg_age, cumulative_stats) = stats_tracker.get_stats().await;
+    let queued_requests = active_requests.saturating_sub(executor_fibers);
+
+    let (max_age, avg_age, cumulative_stats) = stats_tracker.get_stats();
 
     Ok(EthCallCapacityStats {
         inactive_executors,
         queued_requests,
         oldest_request_age_ms: max_age.map(|d| d.as_millis() as u64).unwrap_or(0),
         average_request_age_ms: avg_age.map(|d| d.as_millis() as u64).unwrap_or(0),
-        total_requests: cumulative_stats.total_requests.load(Ordering::Relaxed),
-        total_errors: cumulative_stats.total_errors.load(Ordering::Relaxed),
-        queue_rejections: cumulative_stats.queue_rejections.load(Ordering::Relaxed),
+        total_requests: cumulative_stats.total_requests,
+        total_errors: cumulative_stats.total_errors,
+        queue_rejections: cumulative_stats.queue_rejections,
     })
 }
 
