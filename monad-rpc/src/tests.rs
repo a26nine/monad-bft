@@ -39,13 +39,13 @@ pub async fn init_server(
         txpool_bridge_client: Some(EthTxPoolBridgeClient::for_testing()),
         eth_call_handler: None,
         chain_id: 1337,
-        chain_state: None,
+        data_provider: None,
+        event_server_client: None,
         batch_request_limit: 5,
+        batch_concurrent_limit: 5,
         max_response_size: 25_000_000,
         allow_unprotected_txs: false,
         logs_max_block_range: 1000,
-        eth_call_provider_gas_limit: u64::MAX,
-        eth_estimate_gas_provider_gas_limit: u64::MAX,
         eth_send_raw_transaction_sync_default_timeout_ms: 2_000,
         eth_send_raw_transaction_sync_max_timeout_ms: 10_000,
         dry_run_get_logs_index: false,
@@ -57,7 +57,7 @@ pub async fn init_server(
 
     test::init_service(
         App::new()
-            .wrap(DecompressionGuard::new(2_000_000))
+            .wrap(DecompressionGuard::default())
             .wrap(TracingLogger::<MonadJsonRootSpanBuilder>::new())
             .app_data(web::PayloadConfig::default().limit(2_000_000))
             .app_data(web::Data::new(app_state.clone()))

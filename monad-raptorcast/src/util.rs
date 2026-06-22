@@ -13,10 +13,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+macro_rules! ensure {
+    ($cond:expr, $err:expr) => {
+        if !($cond) {
+            return Err($err.into());
+        }
+    };
+}
 use std::{
     cell::OnceCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    future::Future,
     net::SocketAddr,
     num::NonZero,
     ops::Range,
@@ -24,40 +32,124 @@ use std::{
 };
 
 use bytes::Bytes;
+pub(crate) use ensure; // export the macro for use in other modules
 use fixed::{types::extra::U11, FixedU16};
 use iset::IntervalMap;
 use monad_crypto::{
     certificate_signature::{CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey},
     hasher::{Hasher, HasherType},
 };
-use monad_types::{Epoch, NodeId, Round, RoundSpan};
-use monad_validator::validator_set::{ValidatorSet, ValidatorSetType as _};
+use monad_types::{Epoch, NodeId, Round, RoundSpan, Stake};
+use monad_validator::{
+    proposer_schedule::ProposerSchedule,
+    validator_set::{ValidatorSet, ValidatorSetType as _},
+};
 
 use crate::udp::GroupId;
+
+/// Await a future, consuming one unit of shared quota; once depleted,
+/// yield to others and request executor to wake up the task
+/// again. Used to prevent starvation.
+pub async fn budgeted<F: Future>(fut: F, quota: &mut usize) -> F::Output {
+    if *quota == 0 {
+        tokio::task::yield_now().await;
+        *quota = 1; // each yielding restores one more unit
+    }
+    let out = fut.await;
+    *quota -= 1;
+    out
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RaptorcastMode {
+    Regular,
+    Deterministic { round: Round, epoch: Epoch },
+}
 
 // Argument for raptorcast send
 #[derive(Debug, Clone, Copy)]
 pub enum BuildTarget<'a, PT: PubKey> {
     // broadcast a message to the validators where each validator gets
     // the full chunks of the raptor-coded message
-    Broadcast(&'a ValidatorSet<PT>),
+    Broadcast(PrimaryBroadcastGroup<'a, PT>),
     // raptorcast to the validators, chunks distributed by their
     // proportion of stakes.
-    Raptorcast(&'a ValidatorSet<PT>),
+    Raptorcast {
+        group: PrimaryBroadcastGroup<'a, PT>,
+        mode: RaptorcastMode,
+    },
     // unicast message as raptor-coded chunks to a single recipient
-    PointToPoint(&'a NodeId<PT>),
-    // raptorcast to a set of full nodes, assuming equal stake
-    // distribution
-    FullNodeRaptorCast(&'a SecondaryGroup<PT>),
+    PointToPoint {
+        group_id: GroupId,
+        recipient: &'a NodeId<PT>,
+    },
+    // raptorcast to a set of full nodes. In regular mode, chunks are
+    // assigned round-robin; in deterministic mode, chunks are
+    // assigned by the seeded shuffle of the full-node group.
+    FullNodeRaptorCast {
+        group: SecondaryBroadcastGroup<'a, PT>,
+        mode: RaptorcastMode,
+    },
 }
 
 impl<'a, PT: PubKey> BuildTarget<'a, PT> {
+    pub fn raptorcast(group: PrimaryBroadcastGroup<'a, PT>) -> Self {
+        BuildTarget::Raptorcast {
+            group,
+            mode: RaptorcastMode::Regular,
+        }
+    }
+
+    pub fn deterministic_raptorcast(group: PrimaryBroadcastGroup<'a, PT>, round: Round) -> Self {
+        let epoch = group.epoch();
+        BuildTarget::Raptorcast {
+            group,
+            mode: RaptorcastMode::Deterministic { round, epoch },
+        }
+    }
+
+    pub fn fullnode_raptorcast(group: SecondaryBroadcastGroup<'a, PT>) -> Self {
+        BuildTarget::FullNodeRaptorCast {
+            group,
+            mode: RaptorcastMode::Regular,
+        }
+    }
+
+    pub fn deterministic_fullnode_raptorcast(
+        group: SecondaryBroadcastGroup<'a, PT>,
+        epoch: Epoch,
+    ) -> Self {
+        let round = group.round();
+        BuildTarget::FullNodeRaptorCast {
+            group,
+            mode: RaptorcastMode::Deterministic { round, epoch },
+        }
+    }
+
+    pub fn point_to_point(epoch: Epoch, recipient: &'a NodeId<PT>) -> Self {
+        BuildTarget::PointToPoint {
+            group_id: GroupId::Primary(epoch),
+            recipient,
+        }
+    }
+
     pub fn iter(&self) -> Box<dyn Iterator<Item = &NodeId<PT>> + '_> {
         match self {
-            BuildTarget::Broadcast(valset) => Box::new(valset.get_members().keys()),
-            BuildTarget::Raptorcast(valset) => Box::new(valset.get_members().keys()),
-            BuildTarget::PointToPoint(node_id) => Box::new(std::iter::once(*node_id)),
-            BuildTarget::FullNodeRaptorCast(group) => Box::new(group.iter()),
+            BuildTarget::Broadcast(group) | BuildTarget::Raptorcast { group, .. } => {
+                Box::new(group.iter().map(|(n, _)| n))
+            }
+            BuildTarget::PointToPoint { recipient, .. } => Box::new(std::iter::once(*recipient)),
+            BuildTarget::FullNodeRaptorCast { group, .. } => Box::new(group.iter()),
+        }
+    }
+
+    pub fn group_id(&self) -> GroupId {
+        match self {
+            BuildTarget::Broadcast(group) | BuildTarget::Raptorcast { group, .. } => {
+                group.group_id()
+            }
+            BuildTarget::FullNodeRaptorCast { group, .. } => group.group_id(),
+            BuildTarget::PointToPoint { group_id, .. } => *group_id,
         }
     }
 }
@@ -101,6 +193,19 @@ impl<const N: usize> HexBytes<N> {
 
 pub type NodeIdHash = HexBytes<20>;
 pub type AppMessageHash = HexBytes<20>;
+pub type MerkleRoot = HexBytes<20>;
+pub type GlobalMerkleRoot = MerkleRoot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingScheme {
+    Unspecified,
+
+    // Deterministic RaptorCast (encoding_scheme_variant=0x1)
+    // - redundancy: 2.5
+    // - seed: (round, unix_ts_ms//2048, author_pk[1:17])
+    // - assignment: round-robin
+    Deterministic25(Round),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastMode {
@@ -285,11 +390,17 @@ pub type ValidatorGroupMap<PT> = BTreeMap<Epoch, ValidatorSet<PT>>;
 #[derive(Debug)]
 pub enum BroadcastGroupError {
     // The specified group_id does not correspond to any known group.
-    GroupNotFound,
+    GroupNotFound(GroupId),
     // The author is not a member of the specified group.
     InvalidAuthor,
 }
 
+// Invariances:
+//
+// - the group must be established in epoch_validators
+// - the epoch must be consistent with the group in epoch_validators
+// - the author must be a member of the group
+#[derive(Debug, Clone, Copy)]
 pub struct PrimaryBroadcastGroup<'a, PT: PubKey> {
     epoch: Epoch,
     author: &'a NodeId<PT>,
@@ -302,9 +413,10 @@ impl<'a, PT: PubKey> PrimaryBroadcastGroup<'a, PT> {
         author: &'a NodeId<PT>,
         validator_group_map: &'a ValidatorGroupMap<PT>,
     ) -> Result<Self, BroadcastGroupError> {
+        let group_id = GroupId::Primary(epoch);
         let group = validator_group_map
             .get(&epoch)
-            .ok_or(BroadcastGroupError::GroupNotFound)?;
+            .ok_or(BroadcastGroupError::GroupNotFound(group_id))?;
         if !group.is_member(author) {
             return Err(BroadcastGroupError::InvalidAuthor);
         }
@@ -315,9 +427,25 @@ impl<'a, PT: PubKey> PrimaryBroadcastGroup<'a, PT> {
         })
     }
 
+    pub fn author(&self) -> &NodeId<PT> {
+        self.author
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&NodeId<PT>, &Stake)> + '_ {
+        self.group.get_members().iter()
+    }
+
+    pub fn is_member(&self, node_id: &NodeId<PT>) -> bool {
+        self.group.is_member(node_id)
+    }
+
+    pub fn len(&self) -> NonZero<usize> {
+        NonZero::new(self.group.len()).expect("A validator set must be non-empty")
+    }
+
     // For Primary RC, the sender can be any one of the validators.
     pub fn is_sender_valid(&self, sender: &NodeId<PT>) -> bool {
-        self.group.is_member(sender)
+        self.is_member(sender)
     }
 
     pub fn try_rebroadcast(
@@ -325,16 +453,36 @@ impl<'a, PT: PubKey> PrimaryBroadcastGroup<'a, PT> {
         self_id: &'a NodeId<PT>,
         is_first_hop_recipient: bool,
     ) -> Option<RebroadcastContext<'a, PT>> {
+        // Only rebroadcast if self is a member of the validator set
+        // and is the recipient of the first hop.
         if !self.group.is_member(self_id) || !is_first_hop_recipient {
             return None;
         }
+
         Some(RebroadcastContext {
             members: Box::new(self.group.get_members().keys()),
             excluded: [Some(self_id), Some(self.author)],
         })
     }
+
+    pub fn validator_set(&self) -> &ValidatorSet<PT> {
+        self.group
+    }
+
+    pub fn group_id(&self) -> GroupId {
+        GroupId::Primary(self.epoch)
+    }
+
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
 }
 
+// Invariances:
+//
+// - the group must be established (exists in group_map)
+// - the round number must be consistent with the group
+#[derive(Debug, Clone, Copy)]
 pub struct SecondaryBroadcastGroup<'a, PT: PubKey> {
     round: Round,
     publisher: &'a NodeId<PT>,
@@ -342,21 +490,32 @@ pub struct SecondaryBroadcastGroup<'a, PT: PubKey> {
 }
 
 impl<'a, PT: PubKey> SecondaryBroadcastGroup<'a, PT> {
+    // The caller must ensure the round number to be consistent with
+    // the group.
+    pub fn as_publisher(
+        publisher: &'a NodeId<PT>,
+        round: Round,
+        group: &'a SecondaryGroup<PT>,
+    ) -> Self {
+        Self {
+            round,
+            publisher,
+            group,
+        }
+    }
+
     pub fn of_round(
         round: Round,
         // The publisher is the author/signer of the raptorcast message.
         publisher: &'a NodeId<PT>,
         full_node_group_map: &'a FullNodeGroupMap<PT>,
     ) -> Result<Self, BroadcastGroupError> {
+        let group_id = GroupId::Secondary(round);
         let group = full_node_group_map
             .get_group_map(publisher)
-            .ok_or(BroadcastGroupError::GroupNotFound)?
-            // FIXME: should use `get` method. `get_current_or_next`
-            // implements the old behavior, which can be hit if full node is
-            // upgraded before the validator. It'll be removed after the
-            // upgrade
-            .get_current_or_next(round)
-            .ok_or(BroadcastGroupError::GroupNotFound)?;
+            .ok_or(BroadcastGroupError::GroupNotFound(group_id))?
+            .get(round)
+            .ok_or(BroadcastGroupError::GroupNotFound(group_id))?;
         Ok(Self {
             round,
             publisher,
@@ -383,6 +542,26 @@ impl<'a, PT: PubKey> SecondaryBroadcastGroup<'a, PT> {
             members: Box::new(self.group.iter()),
             excluded: [Some(self_id), None],
         })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &NodeId<PT>> + '_ {
+        self.group.iter()
+    }
+
+    pub fn group_id(&self) -> GroupId {
+        GroupId::Secondary(self.round)
+    }
+
+    pub fn publisher(&self) -> &NodeId<PT> {
+        self.publisher
+    }
+
+    pub fn round(&self) -> Round {
+        self.round
+    }
+
+    pub fn len(&self) -> NonZero<usize> {
+        self.group.len()
     }
 }
 
@@ -416,10 +595,10 @@ impl<'a, PT: PubKey> From<SecondaryBroadcastGroup<'a, PT>> for BroadcastGroup<'a
 }
 
 impl<'a, PT: PubKey> BroadcastGroup<'a, PT> {
-    // Return a known valid group of the given group_id.
+    // Return an established group of the given group_id.
     pub fn from_group_id(
         group_id: GroupId,
-        // The signer of the raptorcast message, not necessarily the sender.
+        // The builder and signer of the raptorcast message, not necessarily the sender.
         author: &'a NodeId<PT>,
         validator_group_map: &'a ValidatorGroupMap<PT>,
         full_node_group_map: &'a FullNodeGroupMap<PT>,
@@ -472,12 +651,61 @@ impl<T> Collector<T> for Vec<T> {
     }
 }
 
+impl<T> Collector<T> for &mut Vec<T> {
+    fn push(&mut self, item: T) {
+        Vec::push(self, item)
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        Vec::reserve(self, additional)
+    }
+}
+
 impl<F, T> Collector<T> for F
 where
     F: FnMut(T),
 {
     fn push(&mut self, item: T) {
         self(item)
+    }
+}
+
+// Automatically rebroadcast messages targeted to self node to the
+// peers in the rebroadcast group. Useful if some chunks are
+// assigned to the publisher as the recipient.
+pub struct AutoRebroadcast<'a, PT, C>
+where
+    PT: PubKey,
+    C: Collector<UdpMessage<PT>>,
+{
+    pub self_id: &'a NodeId<PT>,
+    pub group: BroadcastGroup<'a, PT>,
+    pub sink: C,
+}
+
+impl<'a, PT, C> Collector<UdpMessage<PT>> for AutoRebroadcast<'a, PT, C>
+where
+    PT: PubKey,
+    C: Collector<UdpMessage<PT>>,
+{
+    fn push(&mut self, item: UdpMessage<PT>) {
+        let is_first_hop_recipient = *item.recipient.node_id() == *self.self_id;
+        let Some(rebroadcast_ctx) = self
+            .group
+            .try_rebroadcast(self.self_id, is_first_hop_recipient)
+        else {
+            self.sink.push(item);
+            return;
+        };
+
+        for peer in rebroadcast_ctx.peers() {
+            let dup_item = item.tee(peer);
+            self.sink.push(dup_item);
+        }
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.sink.reserve(additional);
     }
 }
 
@@ -567,7 +795,7 @@ where
     PD: monad_peer_discovery::PeerDiscoveryAlgo<SignatureType = ST>,
 {
     fn lookup(&self, node_id: &NodeId<CertificateSignaturePubKey<ST>>) -> Option<SocketAddr> {
-        self.get_addr(node_id)
+        self.get_udp_addr(node_id)
     }
 }
 
@@ -675,11 +903,20 @@ impl PeerAddrLookup<monad_crypto::NopPubKey> for DummyPeerLookup {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UdpMessage<PT: PubKey> {
     pub recipient: Recipient<PT>,
     pub payload: Bytes,
     pub stride: usize,
+}
+impl<PT: PubKey> UdpMessage<PT> {
+    pub fn tee(&self, peer: &NodeId<PT>) -> UdpMessage<PT> {
+        UdpMessage {
+            recipient: Recipient::new(*peer),
+            payload: self.payload.clone(),
+            stride: self.stride,
+        }
+    }
 }
 
 // Represented as a fixed-point number with 11 fractional bits.
@@ -703,6 +940,18 @@ impl Redundancy {
     pub const fn from_u8(num: u8) -> Self {
         assert!((num as u16) <= u16::MAX >> Self::FRAC_BITS);
         Redundancy(FixedU16::from_bits((num as u16) << Self::FRAC_BITS))
+    }
+
+    pub const fn from_fract(
+        int_part: u8,
+        fract_part_hundredth: u8, // out of 100
+    ) -> Self {
+        assert!((int_part as u16) < u16::MAX >> Self::FRAC_BITS);
+        assert!(fract_part_hundredth < 100);
+
+        let int_bits = (int_part as u16) << Self::FRAC_BITS;
+        let decimal_bits = ((fract_part_hundredth as u32) << Self::FRAC_BITS) / 100;
+        Redundancy(FixedU16::from_bits(int_bits + decimal_bits as u16))
     }
 
     // may round to the nearest representable number when needed
@@ -740,8 +989,39 @@ pub fn unix_ts_ms_now() -> u64 {
         .expect("unix epoch doesn't fit in u64")
 }
 
+// A proposer schedule with a constant verdict for check_*. Only used in testing.
+#[derive(Default)]
+pub struct StubProposerSchedule {
+    pub check_proposer: Option<bool>,
+    pub check_epoch: Option<bool>,
+}
+
+impl StubProposerSchedule {
+    // A schedule that accepts every proposer and epoch. For deterministic
+    // raptorcast tests where the proposer schedule itself is irrelevant.
+    pub const VALID: Self = Self {
+        check_proposer: Some(true),
+        check_epoch: Some(true),
+    };
+}
+
+impl<PT: PubKey> ProposerSchedule<PT> for StubProposerSchedule {
+    fn check_proposer(&self, _node: &NodeId<PT>, _round: Round) -> Option<bool> {
+        self.check_proposer
+    }
+
+    fn check_epoch(&self, _epoch: Epoch, _round: Round) -> Option<bool> {
+        self.check_epoch
+    }
+
+    fn insert_epoch(&mut self, _epoch: Epoch, _epoch_start: Round, _val_set: ValidatorSet<PT>) {}
+    fn prune_below(&mut self, _cutoff: Round) {}
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use monad_crypto::certificate_signature::CertificateSignaturePubKey;
     use monad_secp::SecpSignature;
     use monad_testutil::signing::get_key;
@@ -801,6 +1081,10 @@ mod tests {
         assert!((u16::MAX as usize)
             .checked_mul(Redundancy::MAX_MULTIPLIER + 1)
             .is_none());
+
+        assert!(Redundancy::MAX
+            .scale(crate::message::MAX_MESSAGE_SIZE)
+            .is_some());
     }
 
     #[test]
@@ -1042,7 +1326,7 @@ mod tests {
             &full_node_group_map,
         );
 
-        assert!(matches!(result, Err(BroadcastGroupError::GroupNotFound)));
+        assert!(matches!(result, Err(BroadcastGroupError::GroupNotFound(_))));
     }
 
     #[test]
@@ -1108,7 +1392,7 @@ mod tests {
             &full_node_group_map,
         );
 
-        assert!(matches!(result, Err(BroadcastGroupError::GroupNotFound)));
+        assert!(matches!(result, Err(BroadcastGroupError::GroupNotFound(_))));
     }
 
     #[test]
@@ -1136,7 +1420,7 @@ mod tests {
             &full_node_group_map,
         );
 
-        assert!(matches!(result, Err(BroadcastGroupError::GroupNotFound)));
+        assert!(matches!(result, Err(BroadcastGroupError::GroupNotFound(_))));
     }
 
     #[test]
@@ -1268,5 +1552,112 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&nid(2)));
         assert!(peers.contains(&nid(3)));
+    }
+
+    fn msg(payload: &'static [u8], to: NodeId<PT>) -> UdpMessage<PT> {
+        UdpMessage {
+            recipient: Recipient::new(to),
+            payload: Bytes::from_static(payload),
+            stride: 1024,
+        }
+    }
+
+    #[test]
+    fn test_auto_rebroadcast() {
+        let n1 = nid(1); // self, author
+        let n2 = nid(2);
+        let n3 = nid(3);
+        let n4 = nid(4);
+
+        let mut group_map = ValidatorGroupMap::<PT>::new();
+        group_map.insert(Epoch(1), make_validator_set(&[n1, n2, n3, n4]));
+        let primary = PrimaryBroadcastGroup::of_epoch(Epoch(1), &n1, &group_map).unwrap();
+        let group: BroadcastGroup<_> = primary.into();
+
+        let mut output = Vec::new();
+        let mut collector = AutoRebroadcast {
+            self_id: &n1,
+            group,
+            sink: &mut output,
+        };
+
+        // m1, m2 targeted at self, rebroadcast
+        collector.push(msg(b"m1", n1));
+        collector.push(msg(b"m2", n1));
+        // m3, m4 should pass through
+        collector.push(msg(b"m3", n2));
+        collector.push(msg(b"m4", n3));
+
+        let actual: HashSet<UdpMessage<monad_secp::PubKey>> = output.into_iter().collect();
+        let expected: HashSet<_> = [
+            msg(b"m1", n2),
+            msg(b"m1", n3),
+            msg(b"m1", n4),
+            msg(b"m2", n2),
+            msg(b"m2", n3),
+            msg(b"m2", n4), // m1, m2 rebroadcasted
+            msg(b"m3", n2),
+            msg(b"m4", n3), // m3, m4 passed through
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    mod budgeted {
+        use std::{
+            future::{pending, poll_fn, ready},
+            pin::pin,
+            task::Poll,
+            time::Duration,
+        };
+
+        use futures::{future::poll_immediate, FutureExt};
+        use tokio::time::timeout;
+
+        use crate::util::budgeted;
+
+        #[tokio::test]
+        async fn quota_bounds_drain_pass_and_self_wakes() {
+            let mut polled = 0;
+            let mut drained = 0;
+
+            // expect budgeted to wake the task after first quota
+            // exhaustion. return Ready on second poll.
+            let drain_two_passes = poll_fn(|cx| {
+                polled += 1;
+                let mut quota = 3;
+                while let Poll::Ready(()) = pin!(budgeted(ready(()), &mut quota)).poll_unpin(cx) {
+                    drained += 1;
+                }
+                if polled == 2 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+
+            timeout(Duration::from_secs(1), drain_two_passes)
+                .await
+                .expect("spent quota did not wake the task");
+
+            assert_eq!(drained, 6);
+        }
+
+        #[tokio::test]
+        async fn pending_inner_consumes_no_quota() {
+            let mut quota = 1;
+            let throttled = poll_immediate(budgeted(pending::<()>(), &mut quota)).await;
+            assert_eq!(throttled, None);
+            assert_eq!(quota, 1);
+        }
+
+        #[tokio::test]
+        async fn exhausted_budgeted_resumes_after_yield() {
+            let mut quota = 0;
+            let out = timeout(Duration::from_secs(1), budgeted(ready(7), &mut quota)).await;
+            assert_eq!(out, Ok(7));
+            assert_eq!(quota, 0);
+        }
     }
 }

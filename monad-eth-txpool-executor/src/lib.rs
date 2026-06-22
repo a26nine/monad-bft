@@ -18,34 +18,41 @@ use std::{
     io,
     marker::PhantomData,
     pin::Pin,
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     task::Poll,
     time::Duration,
 };
 
 use alloy_consensus::{transaction::Recovered, TxEnvelope};
+use alloy_eips::Decodable2718;
 use alloy_primitives::Address;
-use alloy_rlp::Decodable;
+use bytes::Bytes;
 use futures::Stream;
 use monad_chain_config::{revision::ChainRevision, ChainConfig};
-use monad_consensus_types::block::BlockPolicy;
+use monad_consensus_types::{
+    block::{BlockPolicy, ProposedExecutionInputs},
+    no_endorsement::FreshProposalCertificate,
+    payload::RoundSignature,
+    quorum_certificate::QuorumCertificate,
+    timeout::TimeoutCertificate,
+};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_txpool::{
-    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, PoolTxKind, TrackedTxLimitsConfig,
+    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, PoolTxKind, ProposalWithSenderGas,
+    TrackedTxLimitsConfig,
 };
 use monad_eth_txpool_types::{
     EthTxPoolDropReason, EthTxPoolEventType, EthTxPoolIpcTx, EthTxPoolTxInputStream,
 };
 use monad_eth_types::{EthExecutionProtocol, ExtractEthAddress};
+use monad_execution_state_read::ExecutionStateRead;
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
-use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
 use monad_peer_score::{ema, StdClock};
 use monad_secp::RecoverableAddress;
-use monad_state_backend::StateBackend;
-use monad_types::{DropTimer, NodeId, Round};
+use monad_types::{DropTimer, Epoch, ExecutionProtocol, NodeId, Round, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tokio::{sync::mpsc, time::Instant};
@@ -69,71 +76,142 @@ mod metrics;
 mod preload;
 mod reset;
 
-pub struct EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
+pub enum TxPoolExecutorCommand<ST, SCT, EPT, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    EPT: ExecutionProtocol,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
+    CCT: ChainConfig<CRT>,
+    CRT: ChainRevision,
+{
+    /// Used to update the nonces of tracked txs
+    BlockCommit(Vec<BPT::ValidatedBlock>),
+
+    CreateProposal {
+        node_id: NodeId<CertificateSignaturePubKey<ST>>,
+        epoch: Epoch,
+        round: Round,
+        seq_num: SeqNum,
+        high_qc: QuorumCertificate<SCT>,
+        round_signature: RoundSignature<SCT::SignatureType>,
+        last_round_tc: Option<TimeoutCertificate<ST, SCT, EPT>>,
+        fresh_proposal_certificate: Option<FreshProposalCertificate<SCT>>,
+
+        tx_limit: usize,
+        proposal_gas_limit: u64,
+        proposal_byte_limit: u64,
+        beneficiary: [u8; 20],
+        timestamp_ns: u128,
+
+        extending_blocks: Vec<BPT::ValidatedBlock>,
+        delayed_execution_results: Vec<EPT::FinalizedHeader>,
+    },
+
+    EnterRound {
+        epoch: Epoch,
+        round: Round,
+        upcoming_leader_rounds: Vec<Round>,
+    },
+
+    // Emitted after statesync is completed
+    Reset {
+        last_delay_committed_blocks: Vec<BPT::ValidatedBlock>,
+    },
+}
+
+pub enum TxPoolExecutorEvent<ST, SCT, EPT>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
+{
+    Proposal {
+        epoch: Epoch,
+        round: Round,
+        seq_num: SeqNum,
+        high_qc: QuorumCertificate<SCT>,
+        timestamp_ns: u128,
+        round_signature: RoundSignature<SCT::SignatureType>,
+        base_fee: u64,
+        base_fee_trend: u64,
+        base_fee_moment: u64,
+        delayed_execution_results: Vec<EPT::FinalizedHeader>,
+        proposed_execution_inputs: ProposedExecutionInputs<EPT>,
+        last_round_tc: Option<TimeoutCertificate<ST, SCT, EPT>>,
+        fresh_proposal_certificate: Option<FreshProposalCertificate<SCT>>,
+    },
+
+    Contribution {
+        sender_gas: BTreeMap<NodeId<SCT::NodeIdPubKey>, u64>,
+    },
+
+    ForwardTxs(Vec<Bytes>),
+}
+
+pub struct EthTxPoolExecutor<ST, SCT, ESRT, CCT, CRT, TIS>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     TIS: EthTxPoolTxInputStream,
 {
-    pool: EthTxPool<ST, SCT, SBT, CCT, CRT>,
+    pool: EthTxPool<ST, SCT, ESRT, CCT, CRT>,
     tx_input_stream: Pin<Box<TIS>>,
 
     reset: EthTxPoolResetTrigger,
     block_policy: EthBlockPolicy<ST, SCT, CCT, CRT>,
-    state_backend: SBT,
+    state_read: ESRT,
     chain_config: CCT,
 
-    events_tx: mpsc::UnboundedSender<MempoolEvent<ST, SCT, EthExecutionProtocol>>,
-    events: mpsc::UnboundedReceiver<MempoolEvent<ST, SCT, EthExecutionProtocol>>,
+    events_tx: mpsc::UnboundedSender<TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>>,
+    events: mpsc::UnboundedReceiver<TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>>,
 
-    forwarding_manager: Pin<Box<EthTxPoolForwardingManager>>,
+    forwarding_manager: Pin<Box<EthTxPoolForwardingManager<NodeId<SCT::NodeIdPubKey>>>>,
     preload_manager: Pin<Box<EthTxPoolPreloadManager>>,
 
     metrics: Arc<EthTxPoolExecutorMetrics>,
-    executor_metrics: ExecutorMetrics,
+    executor_metrics: Arc<ExecutorMetrics>,
 
     _phantom: PhantomData<CRT>,
 }
 
-impl<ST, SCT, SBT, CCT, CRT> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, EthTxPoolIpcServer>
+impl<ST, SCT, ESRT, CCT, CRT> EthTxPoolExecutor<ST, SCT, ESRT, CCT, CRT, EthTxPoolIpcServer>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT> + Send + 'static,
+    ESRT: ExecutionStateRead<ST, SCT> + Send + 'static,
     CCT: ChainConfig<CRT> + Send + 'static,
     CRT: ChainRevision + Send + 'static,
     Self: Unpin,
 {
     pub fn start(
         block_policy: EthBlockPolicy<ST, SCT, CCT, CRT>,
-        state_backend: SBT,
+        state_read: ESRT,
         ipc_config: EthTxPoolIpcConfig,
         soft_tx_expiry: Duration,
         hard_tx_expiry: Duration,
         chain_config: CCT,
         round: Round,
         execution_timestamp_s: u64,
-    ) -> io::Result<EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>> {
+        score_provider: ema::ScoreProvider<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
+        score_reader: ema::ScoreReader<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
+    ) -> io::Result<EthTxPoolExecutorClient<ST, SCT, ESRT, CCT, CRT>> {
         let ipc = Box::pin(EthTxPoolIpcServer::new(ipc_config)?);
 
         let (events_tx, events) = mpsc::unbounded_channel();
 
-        let metrics = Arc::new(EthTxPoolExecutorMetrics::default());
-        let mut executor_metrics = ExecutorMetrics::default();
-        let (_score_provider, score_reader) = ema::create::<
-            NodeId<CertificateSignaturePubKey<ST>>,
-            StdClock,
-        >(ema::ScoreConfig::default(), StdClock);
-
-        metrics.update(&mut executor_metrics);
+        let (executor_metrics, metrics) = EthTxPoolExecutorMetrics::new();
+        let executor_metrics = Arc::new(executor_metrics);
+        let metrics = Arc::new(metrics);
 
         Ok(EthTxPoolExecutorClient::new(
             {
-                let metrics = metrics.clone();
+                let executor_metrics = executor_metrics.clone();
 
                 move |command_rx, forwarded_rx, event_tx| {
                     let pool = EthTxPool::new(
@@ -157,7 +235,7 @@ where
                         tx_input_stream: ipc,
                         block_policy,
                         reset: EthTxPoolResetTrigger::default(),
-                        state_backend,
+                        state_read,
                         chain_config,
 
                         events_tx,
@@ -168,26 +246,24 @@ where
 
                         metrics,
                         executor_metrics,
-
                         _phantom: PhantomData,
                     }
                     .run(command_rx, forwarded_rx, event_tx)
                 }
             },
-            Box::new(move |executor_metrics: &mut ExecutorMetrics| {
-                metrics.update(executor_metrics)
-            }),
+            executor_metrics,
+            score_provider,
             score_reader,
             ForwardedIngressFairQueueConfig::default(),
         ))
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT, TIS> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
+impl<ST, SCT, ESRT, CCT, CRT, TIS> EthTxPoolExecutor<ST, SCT, ESRT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
@@ -198,19 +274,19 @@ where
         mut self,
         mut command_rx: mpsc::Receiver<
             Vec<
-                TxPoolCommand<
+                TxPoolExecutorCommand<
                     ST,
                     SCT,
                     EthExecutionProtocol,
                     EthBlockPolicy<ST, SCT, CCT, CRT>,
-                    SBT,
+                    ESRT,
                     CCT,
                     CRT,
                 >,
             >,
         >,
         mut forwarded_rx: mpsc::Receiver<Vec<ForwardedTxs<SCT>>>,
-        event_tx: mpsc::Sender<MonadEvent<ST, SCT, EthExecutionProtocol>>,
+        event_tx: mpsc::Sender<TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>>,
     ) {
         use futures::StreamExt;
 
@@ -263,6 +339,7 @@ where
                         continue;
                     };
 
+
                     if let Err(err) = event_tx.send(event).await {
                         warn!(?err, "failed to send event to BFT, shutting down txpool executor");
                         break;
@@ -286,8 +363,8 @@ where
             let mut num_invalid_bytes = 0;
 
             ingress_batch.extend(txs.into_iter().filter_map(|raw_tx| {
-                if let Ok(tx) = TxEnvelope::decode(&mut raw_tx.as_ref()) {
-                    Some(tx)
+                if let Ok(tx) = TxEnvelope::decode_2718_exact(raw_tx.as_ref()) {
+                    Some((sender, tx))
                 } else {
                     num_invalid_bytes += 1;
                     None
@@ -296,7 +373,7 @@ where
 
             self.metrics
                 .reject_forwarded_invalid_bytes
-                .fetch_add(num_invalid_bytes, Ordering::SeqCst);
+                .add(num_invalid_bytes);
 
             if num_invalid_bytes != 0 {
                 tracing::warn!(?sender, ?num_invalid_bytes, "invalid forwarded txs");
@@ -310,22 +387,22 @@ where
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT, TIS> Executor for EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
+impl<ST, SCT, ESRT, CCT, CRT, TIS> Executor for EthTxPoolExecutor<ST, SCT, ESRT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     TIS: EthTxPoolTxInputStream,
 {
-    type Command = TxPoolCommand<
+    type Command = TxPoolExecutorCommand<
         ST,
         SCT,
         EthExecutionProtocol,
         EthBlockPolicy<ST, SCT, CCT, CRT>,
-        SBT,
+        ESRT,
         CCT,
         CRT,
     >;
@@ -338,10 +415,10 @@ where
 
         for command in commands {
             match command {
-                TxPoolCommand::BlockCommit(committed_blocks) => {
+                TxPoolExecutorCommand::BlockCommit(committed_blocks) => {
                     let _span = debug_span!("block commit").entered();
                     for committed_block in committed_blocks {
-                        BlockPolicy::<ST, SCT, EthExecutionProtocol, SBT, CCT, CRT>::update_committed_block(
+                        BlockPolicy::<ST, SCT, EthExecutionProtocol, ESRT, CCT, CRT>::update_committed_block(
                             &mut self.block_policy,
                             &committed_block,
                         );
@@ -361,7 +438,7 @@ where
                         .project()
                         .schedule_egress_txs(&mut self.pool);
                 }
-                TxPoolCommand::CreateProposal {
+                TxPoolExecutorCommand::CreateProposal {
                     node_id,
                     epoch,
                     round,
@@ -405,19 +482,22 @@ where
                         round_signature.clone(),
                         extending_blocks,
                         &self.block_policy,
-                        &self.state_backend,
+                        &mut self.state_read,
                         &self.chain_config,
                     ) {
-                        Ok(proposed_execution_inputs) => {
+                        Ok(ProposalWithSenderGas {
+                            proposed_execution_inputs,
+                            sender_gas,
+                        }) => {
                             let elapsed = create_proposal_start.elapsed();
 
-                            self.metrics.create_proposal.fetch_add(1, Ordering::SeqCst);
+                            self.metrics.create_proposal.inc();
                             self.metrics
                                 .create_proposal_elapsed_ns
-                                .fetch_add(elapsed.as_nanos() as u64, Ordering::SeqCst);
+                                .add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX));
 
                             self.events_tx
-                                .send(MempoolEvent::Proposal {
+                                .send(TxPoolExecutorEvent::Proposal {
                                     epoch,
                                     round,
                                     seq_num,
@@ -433,17 +513,18 @@ where
                                     fresh_proposal_certificate,
                                 })
                                 .expect("events never dropped");
+                            if !sender_gas.is_empty() {
+                                self.events_tx
+                                    .send(TxPoolExecutorEvent::Contribution { sender_gas })
+                                    .expect("events never dropped");
+                            }
                         }
                         Err(err) => {
                             error!(?err, "txpool executor failed to create proposal");
                         }
                     }
                 }
-                TxPoolCommand::InsertForwardedTxs { sender, txs } => {
-                    // This will never happen because we separate out these commands in `EthTxPoolExecutorClient`.
-                    error!("txpool executor received InsertForwardedTxs command over command rx");
-                }
-                TxPoolCommand::EnterRound {
+                TxPoolExecutorCommand::EnterRound {
                     epoch: _,
                     round,
                     upcoming_leader_rounds,
@@ -462,10 +543,10 @@ where
                         || self.pool.generate_sender_snapshot(),
                     );
                 }
-                TxPoolCommand::Reset {
+                TxPoolExecutorCommand::Reset {
                     last_delay_committed_blocks,
                 } => {
-                    BlockPolicy::<ST, SCT, EthExecutionProtocol, SBT, CCT, CRT>::reset(
+                    BlockPolicy::<ST, SCT, EthExecutionProtocol, ESRT, CCT, CRT>::reset(
                         &mut self.block_policy,
                         last_delay_committed_blocks.iter().collect(),
                     );
@@ -481,23 +562,21 @@ where
             }
         }
 
-        self.metrics.update(&mut self.executor_metrics);
-
         self.tx_input_stream
             .as_mut()
             .broadcast_tx_events(ipc_events);
     }
 
     fn metrics(&self) -> ExecutorMetricsChain<'_> {
-        ExecutorMetricsChain::default().push(&self.executor_metrics)
+        ExecutorMetricsChain::default().push(self.executor_metrics.as_ref())
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT, TIS> Stream for EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
+impl<ST, SCT, ESRT, CCT, CRT, TIS> Stream for EthTxPoolExecutor<ST, SCT, ESRT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
@@ -505,7 +584,7 @@ where
 
     Self: Unpin,
 {
-    type Item = MonadEvent<ST, SCT, EthExecutionProtocol>;
+    type Item = TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -522,7 +601,7 @@ where
 
             reset,
             block_policy,
-            state_backend,
+            state_read,
             chain_config,
 
             events_tx: _,
@@ -532,15 +611,14 @@ where
             preload_manager,
 
             metrics,
-            executor_metrics,
-
+            executor_metrics: _,
             _phantom,
         } = self.get_mut();
 
         if let Poll::Ready(result) = events.poll_recv(cx) {
             let event = result.expect("events_tx never dropped");
 
-            return Poll::Ready(Some(MonadEvent::MempoolEvent(event)));
+            return Poll::Ready(Some(event));
         };
 
         if !reset.poll_is_ready(cx) {
@@ -591,7 +669,7 @@ where
             pool.insert_txs(
                 &mut EthTxPoolEventTracker::new(&metrics.pool, &mut ipc_events),
                 block_policy,
-                state_backend,
+                state_read,
                 chain_config,
                 recovered_txs,
                 |tx| {
@@ -610,7 +688,6 @@ where
                 .project()
                 .add_egress_txs(immediately_forwardable_txs.iter());
 
-            metrics.update(executor_metrics);
             tx_input_stream.as_mut().broadcast_tx_events(ipc_events);
 
             cx.waker().wake_by_ref();
@@ -620,9 +697,7 @@ where
             .as_mut()
             .poll_egress(pool.current_revision().1.execution_chain_params(), cx)
         {
-            return Poll::Ready(Some(MonadEvent::MempoolEvent(MempoolEvent::ForwardTxs(
-                forward_txs,
-            ))));
+            return Poll::Ready(Some(TxPoolExecutorEvent::ForwardTxs(forward_txs)));
         }
 
         let mut ipc_events = BTreeMap::default();
@@ -632,12 +707,12 @@ where
 
             let recovered_txs = {
                 let (recovered_txs, dropped_txs): (Vec<_>, Vec<_>) =
-                    forwarded_txs.into_par_iter().partition_map(|tx| {
+                    forwarded_txs.into_par_iter().partition_map(|(sender, tx)| {
                         let _span = trace_span!("txpool: forwarded tx recover signer").entered();
                         match tx.secp256k1_recover() {
                             Ok(signer) => rayon::iter::Either::Left((
                                 Recovered::new_unchecked(tx, signer),
-                                PoolTxKind::Forwarded,
+                                PoolTxKind::Forwarded { sender },
                             )),
                             Err(_) => rayon::iter::Either::Right((
                                 *tx.tx_hash(),
@@ -656,7 +731,7 @@ where
             pool.insert_txs(
                 &mut EthTxPoolEventTracker::new(&metrics.pool, &mut ipc_events),
                 block_policy,
-                state_backend,
+                state_read,
                 chain_config,
                 recovered_txs,
                 |tx| {
@@ -675,34 +750,30 @@ where
                 "txpool executor preloading account balances"
             );
 
-            let total_db_lookups_before = state_backend.total_db_lookups();
+            let total_db_lookups_before = state_read.total_db_lookups();
 
-            if let Err(state_backend_error) = block_policy.compute_account_base_balances(
+            if let Err(state_read_error) = block_policy.compute_account_base_balances(
                 predicted_proposal_seqnum,
-                state_backend,
+                state_read,
                 chain_config,
                 None,
                 addresses.iter(),
             ) {
                 warn!(
-                    ?state_backend_error,
+                    ?state_read_error,
                     "txpool executor failed to preload account balances"
                 )
             }
 
-            metrics.preload_backend_lookups.fetch_add(
-                state_backend.total_db_lookups() - total_db_lookups_before,
-                Ordering::SeqCst,
-            );
             metrics
-                .preload_backend_requests
-                .fetch_add(addresses.len() as u64, Ordering::SeqCst);
+                .preload_backend_lookups
+                .add(state_read.total_db_lookups() - total_db_lookups_before);
+            metrics.preload_backend_requests.add(addresses.len() as u64);
 
             preload_manager
                 .complete_polled_requests(predicted_proposal_seqnum, addresses.into_iter());
         }
 
-        metrics.update(executor_metrics);
         tx_input_stream.as_mut().broadcast_tx_events(ipc_events);
 
         Poll::Pending
@@ -738,12 +809,12 @@ mod test {
         EthTxPoolEventType, EthTxPoolIpcTx, EthTxPoolSnapshot, EthTxPoolTxInputStream,
     };
     use monad_eth_types::EthExecutionProtocol;
-    use monad_executor::{Executor, ExecutorMetrics};
-    use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
-    use monad_peer_score::{ema, StdClock};
-    use monad_state_backend::{
+    use monad_execution_state_read::{
         AccountState, InMemoryBlockState, InMemoryState, InMemoryStateInner,
     };
+    use monad_executor::Executor;
+    use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
+    use monad_peer_score::{ema, StdClock};
     use monad_testutil::signing::{node_id, MockSignatures};
     use monad_tfm::base_fee::MIN_BASE_FEE;
     use monad_types::{Epoch, NodeId, Round, SeqNum, GENESIS_ROUND, GENESIS_SEQ_NUM};
@@ -759,11 +830,11 @@ mod test {
 
     type SignatureType = NopSignature;
     type SignatureCollectionType = MockSignatures<SignatureType>;
-    type StateBackendType = InMemoryState<SignatureType, SignatureCollectionType>;
+    type ExecutionStateReadType = InMemoryState<SignatureType, SignatureCollectionType>;
     type ExecutorType = EthTxPoolExecutor<
         SignatureType,
         SignatureCollectionType,
-        StateBackendType,
+        ExecutionStateReadType,
         MockChainConfig,
         MockChainRevision,
         NoopTxInputStream,
@@ -773,7 +844,7 @@ mod test {
         SignatureCollectionType,
         EthExecutionProtocol,
         EthBlockPolicy<SignatureType, SignatureCollectionType, MockChainConfig, MockChainRevision>,
-        StateBackendType,
+        ExecutionStateReadType,
         MockChainConfig,
         MockChainRevision,
     >;
@@ -906,14 +977,14 @@ mod test {
     ) -> EthTxPoolExecutorClient<
         SignatureType,
         SignatureCollectionType,
-        StateBackendType,
+        ExecutionStateReadType,
         MockChainConfig,
         MockChainRevision,
     > {
         const TEST_TX_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 
         let block_policy = EthBlockPolicy::new(GENESIS_SEQ_NUM, u64::MAX);
-        let state_backend: StateBackendType = InMemoryStateInner::new(
+        let state_read: ExecutionStateReadType = InMemoryStateInner::new(
             SeqNum::MAX,
             InMemoryBlockState::genesis(BTreeMap::from_iter([(
                 secret_to_eth_address(S1),
@@ -926,47 +997,56 @@ mod test {
 
         let (events_tx, events) = mpsc::unbounded_channel();
 
-        let (_score_provider, score_reader) = ema::create::<
+        let (score_provider, score_reader) = ema::create::<
             NodeId<CertificateSignaturePubKey<SignatureType>>,
             StdClock,
         >(ema::ScoreConfig::default(), StdClock);
 
-        EthTxPoolExecutorClient::new(
-            move |command_rx, forwarded_rx, event_tx| {
-                let pool = EthTxPool::new(
-                    EthTxPoolConfig {
-                        limits: TrackedTxLimitsConfig::new(
-                            None,
-                            None,
-                            None,
-                            None,
-                            TEST_TX_EXPIRY,
-                            TEST_TX_EXPIRY,
-                        ),
-                    },
-                    chain_config.chain_id(),
-                    chain_config.get_chain_revision(round),
-                    chain_config.get_execution_chain_revision(execution_timestamp_s),
-                );
+        let (executor_metrics, metrics) = EthTxPoolExecutorMetrics::new();
+        let executor_metrics = Arc::new(executor_metrics);
+        let metrics = Arc::new(metrics);
 
-                ExecutorType {
-                    pool,
-                    tx_input_stream: Box::pin(NoopTxInputStream),
-                    reset: EthTxPoolResetTrigger::default(),
-                    block_policy,
-                    state_backend,
-                    chain_config,
-                    events_tx,
-                    events,
-                    forwarding_manager: Box::pin(EthTxPoolForwardingManager::default()),
-                    preload_manager: Box::pin(EthTxPoolPreloadManager::default()),
-                    metrics: Arc::new(EthTxPoolExecutorMetrics::default()),
-                    executor_metrics: ExecutorMetrics::default(),
-                    _phantom: PhantomData,
+        EthTxPoolExecutorClient::new(
+            {
+                let executor_metrics = executor_metrics.clone();
+
+                move |command_rx, forwarded_rx, event_tx| {
+                    let pool = EthTxPool::new(
+                        EthTxPoolConfig {
+                            limits: TrackedTxLimitsConfig::new(
+                                None,
+                                None,
+                                None,
+                                None,
+                                TEST_TX_EXPIRY,
+                                TEST_TX_EXPIRY,
+                            ),
+                        },
+                        chain_config.chain_id(),
+                        chain_config.get_chain_revision(round),
+                        chain_config.get_execution_chain_revision(execution_timestamp_s),
+                    );
+
+                    ExecutorType {
+                        pool,
+                        tx_input_stream: Box::pin(NoopTxInputStream),
+                        reset: EthTxPoolResetTrigger::default(),
+                        block_policy,
+                        state_read,
+                        chain_config,
+                        events_tx,
+                        events,
+                        forwarding_manager: Box::pin(EthTxPoolForwardingManager::default()),
+                        preload_manager: Box::pin(EthTxPoolPreloadManager::default()),
+                        metrics,
+                        executor_metrics,
+                        _phantom: PhantomData,
+                    }
+                    .run(command_rx, forwarded_rx, event_tx)
                 }
-                .run(command_rx, forwarded_rx, event_tx)
             },
-            Box::new(|_| {}),
+            executor_metrics,
+            score_provider,
             score_reader,
             forwarded_ingress_fair_queue_config,
         )
@@ -975,7 +1055,7 @@ mod test {
     fn start_test_client() -> EthTxPoolExecutorClient<
         SignatureType,
         SignatureCollectionType,
-        StateBackendType,
+        ExecutionStateReadType,
         MockChainConfig,
         MockChainRevision,
     > {

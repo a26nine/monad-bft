@@ -44,7 +44,7 @@ use monad_eth_txpool::{
     TrackedTxLimitsConfig,
 };
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, EthHeader, ProposedEthHeader};
-use monad_state_backend::NopStateBackend;
+use monad_execution_state_read::NopExecutionStateRead;
 use monad_testutil::signing::MockSignatures;
 use monad_types::{Epoch, NodeId, Round, SeqNum, GENESIS_BLOCK_ID, GENESIS_ROUND, GENESIS_SEQ_NUM};
 use tracing::info;
@@ -59,7 +59,7 @@ type TestBlockPolicy = EthBlockPolicy<
 type TestTxPool = EthTxPool<
     NopSignature,
     MockSignatures<NopSignature>,
-    NopStateBackend,
+    NopExecutionStateRead,
     MonadChainConfig,
     MonadChainRevision,
 >;
@@ -78,351 +78,348 @@ fn sanity_check_coherency() {
     let (_, seq_num, block_policy, chain_config) = genesis_setup();
 
     let txs = BTreeMap::from([(seq_num, vec![])]);
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         ..Default::default()
     };
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_insufficient_single_emptying_transaction() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = insufficient_single_emptying_transaction_inputs();
+    let (txs, state_read) = insufficient_single_emptying_transaction_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_insufficient_single_emptying_transaction_2() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = insufficient_single_emptying_transaction_inputs_2();
+    let (txs, state_read) = insufficient_single_emptying_transaction_inputs_2();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_sufficient_single_emptying_transaction() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = sufficient_single_emptying_transaction_inputs();
+    let (txs, state_read) = sufficient_single_emptying_transaction_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_insufficient_emptying_transaction() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = insufficient_emptying_transaction_inputs();
+    let (txs, state_read) = insufficient_emptying_transaction_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_insufficient_emptying_transaction_2() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = insufficient_emptying_transaction_inputs_2();
+    let (txs, state_read) = insufficient_emptying_transaction_inputs_2();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_sufficient_emptying_transaction() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = sufficient_emptying_transaction_inputs();
+    let (txs, state_read) = sufficient_emptying_transaction_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_emptying_transaction_different_blocks_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_transaction_different_blocks_insufficient_inputs();
+    let (txs, state_read) = emptying_transaction_different_blocks_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_emptying_transaction_different_blocks_insufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_transaction_different_blocks_insufficient_reserve_inputs();
+    let (txs, state_read) = emptying_transaction_different_blocks_insufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_emptying_transaction_different_blocks_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_transaction_different_blocks_sufficient_inputs();
+    let (txs, state_read) = emptying_transaction_different_blocks_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_non_emptying_transaction_different_blocks_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = non_emptying_transaction_different_blocks_insufficient_inputs();
+    let (txs, state_read) = non_emptying_transaction_different_blocks_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_non_emptying_transaction_different_blocks_insufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) =
-        non_emptying_transaction_different_blocks_insufficient_reserve_inputs();
+    let (txs, state_read) = non_emptying_transaction_different_blocks_insufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_non_emptying_transaction_different_blocks_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = non_emptying_transaction_different_blocks_sufficient_inputs();
+    let (txs, state_read) = non_emptying_transaction_different_blocks_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_delegation_non_emptying_same_block_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_non_emptying_same_block_insufficient_inputs();
+    let (txs, state_read) = delegation_non_emptying_same_block_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_non_emptying_same_block_insufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_non_emptying_same_block_insufficient_reserve_inputs();
+    let (txs, state_read) = delegation_non_emptying_same_block_insufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_non_emptying_same_block_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_non_emptying_same_block_sufficient_inputs();
+    let (txs, state_read) = delegation_non_emptying_same_block_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_invalid_delegation_non_emptying_same_block() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = invalid_delegation_non_emptying_same_block_inputs();
+    let (txs, state_read) = invalid_delegation_non_emptying_same_block_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_delegation_non_emptying_different_blocks_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_non_emptying_different_blocks_insufficient_inputs();
+    let (txs, state_read) = delegation_non_emptying_different_blocks_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_non_emptying_different_blocks_insufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) =
-        delegation_non_emptying_different_blocks_insufficient_reserve_inputs();
+    let (txs, state_read) = delegation_non_emptying_different_blocks_insufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_non_emptying_different_blocks_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_non_emptying_different_blocks_sufficient_inputs();
+    let (txs, state_read) = delegation_non_emptying_different_blocks_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_invalid_delegation_non_emptying_different_blocks() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = invalid_delegation_non_emptying_different_blocks_inputs();
+    let (txs, state_read) = invalid_delegation_non_emptying_different_blocks_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_invalid_delegation_non_emptying_different_blocks_2() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = invalid_delegation_non_emptying_different_blocks_inputs_2();
+    let (txs, state_read) = invalid_delegation_non_emptying_different_blocks_inputs_2();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_emptying_txn_and_delegation_same_block() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_txn_and_delegation_same_block_inputs();
+    let (txs, state_read) = emptying_txn_and_delegation_same_block_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_emptying_txn_with_value_and_delegation_same_block() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_txn_with_value_and_delegation_same_block_inputs();
+    let (txs, state_read) = emptying_txn_with_value_and_delegation_same_block_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_sufficient_balance_emptying_txn_with_value_and_delegation_same_block() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) =
+    let (txs, state_read) =
         sufficient_balance_emptying_txn_with_value_and_delegation_same_block_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_delegation_and_transfer_same_transaction_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_and_transfer_same_transaction_insufficient_inputs();
+    let (txs, state_read) = delegation_and_transfer_same_transaction_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_and_transfer_same_transaction_insufficient_2() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_and_transfer_same_transaction_insufficient_inputs_2();
+    let (txs, state_read) = delegation_and_transfer_same_transaction_insufficient_inputs_2();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_and_transfer_same_transaction_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_and_transfer_same_transaction_sufficient_inputs();
+    let (txs, state_read) = delegation_and_transfer_same_transaction_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_prev_block_delegation_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = prev_block_delegation_insufficient_inputs();
+    let (txs, state_read) = prev_block_delegation_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_prev_block_delegation_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = prev_block_delegation_sufficient_inputs();
+    let (txs, state_read) = prev_block_delegation_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_emptying_non_emptying_delegation_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_non_emptying_delegation_insufficient_inputs();
+    let (txs, state_read) = emptying_non_emptying_delegation_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_emptying_delegation_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_delegation_sufficient_inputs();
+    let (txs, state_read) = emptying_delegation_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_delegation_undelegation_insufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_undelegation_insufficient_reserve_inputs();
+    let (txs, state_read) = delegation_undelegation_insufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_delegation_undelegation_sufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = delegation_undelegation_sufficient_reserve_inputs();
+    let (txs, state_read) = delegation_undelegation_sufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_emptying_and_delegation_preceding_blocks_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_and_delegation_preceding_blocks_insufficient_inputs();
+    let (txs, state_read) = emptying_and_delegation_preceding_blocks_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_emptying_and_delegation_preceding_blocks_insufficient_reserve() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) =
-        emptying_and_delegation_preceding_blocks_insufficient_reserve_inputs();
+    let (txs, state_read) = emptying_and_delegation_preceding_blocks_insufficient_reserve_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_emptying_and_delegation_preceding_blocks_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = emptying_and_delegation_preceding_blocks_sufficient_inputs();
+    let (txs, state_read) = emptying_and_delegation_preceding_blocks_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_multiple_non_emptying_same_block_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = multiple_non_emptying_same_block_insufficient_inputs();
+    let (txs, state_read) = multiple_non_emptying_same_block_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_multiple_non_emptying_same_block_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = multiple_non_emptying_same_block_sufficient_inputs();
+    let (txs, state_read) = multiple_non_emptying_same_block_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_multiple_non_emptying_different_blocks_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = multiple_non_emptying_different_blocks_insufficient_inputs();
+    let (txs, state_read) = multiple_non_emptying_different_blocks_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 #[test]
 fn test_multiple_non_emptying_different_blocks_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = multiple_non_emptying_different_blocks_sufficient_inputs();
+    let (txs, state_read) = multiple_non_emptying_different_blocks_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_invalid_delegation_non_emptying_sufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = invalid_delegation_non_emptying_sufficient_inputs();
+    let (txs, state_read) = invalid_delegation_non_emptying_sufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, true);
+    test_runner(chain_config, block_policy, state_read, txs, true);
 }
 
 #[test]
 fn test_invalid_delegation_non_emptying_insufficient() {
     let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
-    let (txs, state_backend) = invalid_delegation_non_emptying_insufficient_inputs();
+    let (txs, state_read) = invalid_delegation_non_emptying_insufficient_inputs();
 
-    test_runner(chain_config, block_policy, state_backend, txs, false);
+    test_runner(chain_config, block_policy, state_read, txs, false);
 }
 
 fn create_test_txpool(chain_config: &MonadChainConfig) -> TestTxPool {
@@ -447,28 +444,15 @@ fn check_txpool_coherency(
     chain_config: &MonadChainConfig,
     extending_blocks: &[EthValidatedBlock<NopSignature, MockSignatures<NopSignature>>],
     block_under_test: &EthValidatedBlock<NopSignature, MockSignatures<NopSignature>>,
-    state_backend: &NopStateBackend,
+    state_read: &mut NopExecutionStateRead,
     root_info: RootInfo,
 ) {
-    let mut block_policy = TestBlockPolicy::new(GENESIS_SEQ_NUM, 3);
+    let block_policy = TestBlockPolicy::new(GENESIS_SEQ_NUM, 3);
 
     let mut txpool = create_test_txpool(chain_config);
     let metrics = EthTxPoolMetrics::default();
     let mut ipc_events = BTreeMap::default();
     let mut event_tracker = EthTxPoolEventTracker::new(&metrics, &mut ipc_events);
-
-    // insert extending blocks to txpool
-    for extending_block in extending_blocks.iter() {
-        txpool.update_committed_block(&mut event_tracker, chain_config, extending_block.clone());
-        <TestBlockPolicy as BlockPolicy<
-            NopSignature,
-            MockSignatures<NopSignature>,
-            EthExecutionProtocol,
-            NopStateBackend,
-            MonadChainConfig,
-            MonadChainRevision,
-        >>::update_committed_block(&mut block_policy, extending_block);
-    }
 
     // insert transactions of the incoming block into txpool
     let block_txs: Vec<Recovered<TxEnvelope>> = block_under_test
@@ -480,11 +464,18 @@ fn check_txpool_coherency(
         txpool.insert_txs(
             &mut event_tracker,
             &block_policy,
-            state_backend,
+            state_read,
             chain_config,
             block_txs
                 .into_iter()
-                .map(|tx| (tx, PoolTxKind::Forwarded))
+                .map(|tx| {
+                    (
+                        tx,
+                        PoolTxKind::Forwarded {
+                            sender: *block_under_test.get_author(),
+                        },
+                    )
+                })
                 .collect(),
             |_tx| {},
         );
@@ -516,10 +507,11 @@ fn check_txpool_coherency(
             block_under_test.header().round_signature.clone(),
             extending_blocks.to_vec(),
             &block_policy,
-            state_backend,
+            state_read,
             chain_config,
         )
-        .unwrap();
+        .unwrap()
+        .proposed_execution_inputs;
 
     info!(
         "Txpool created proposal with {} txs for seq_num {:?}",
@@ -549,7 +541,7 @@ fn check_txpool_coherency(
             &created_block,
             extending_blocks.iter().collect(),
             root_info,
-            state_backend,
+            state_read,
             chain_config,
         )
         .expect("Txpool created proposal that failed coherency check");
@@ -558,7 +550,7 @@ fn check_txpool_coherency(
 fn test_runner(
     chain_config: MonadChainConfig,
     block_policy: TestBlockPolicy,
-    state_backend: NopStateBackend,
+    mut state_read: NopExecutionStateRead,
     txs: BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
     expect_coherent: bool,
 ) {
@@ -577,7 +569,7 @@ fn test_runner(
             block_under_test,
             extending.iter().collect(),
             root_info,
-            &state_backend,
+            &mut state_read,
             &chain_config,
         );
 
@@ -591,7 +583,7 @@ fn test_runner(
                 &chain_config,
                 extending,
                 block_under_test,
-                &state_backend,
+                &mut state_read,
                 root_info,
             );
         }
@@ -737,7 +729,7 @@ fn create_test_block_helper(
         MockSignatures<NopSignature>,
         EthExecutionProtocol,
         TestBlockPolicy,
-        NopStateBackend,
+        NopExecutionStateRead,
         MonadChainConfig,
         MonadChainRevision,
     >::validate(
@@ -835,7 +827,7 @@ pub fn sign_authorization(
 // 1
 fn insufficient_single_emptying_transaction_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -850,18 +842,18 @@ fn insufficient_single_emptying_transaction_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(2 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 2
 fn insufficient_single_emptying_transaction_inputs_2() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -876,18 +868,18 @@ fn insufficient_single_emptying_transaction_inputs_2() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 3
 fn sufficient_single_emptying_transaction_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -902,18 +894,18 @@ fn sufficient_single_emptying_transaction_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 4
 fn insufficient_emptying_transaction_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -929,18 +921,18 @@ fn insufficient_emptying_transaction_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 5
 fn insufficient_emptying_transaction_inputs_2() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -957,18 +949,18 @@ fn insufficient_emptying_transaction_inputs_2() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(20 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 6
 fn sufficient_emptying_transaction_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -985,18 +977,18 @@ fn sufficient_emptying_transaction_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 7
 fn emptying_transaction_different_blocks_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1012,18 +1004,18 @@ fn emptying_transaction_different_blocks_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 8
 fn emptying_transaction_different_blocks_insufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1040,18 +1032,18 @@ fn emptying_transaction_different_blocks_insufficient_reserve_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(20 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 9
 fn emptying_transaction_different_blocks_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1068,18 +1060,18 @@ fn emptying_transaction_different_blocks_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 10
 fn non_emptying_transaction_different_blocks_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1099,18 +1091,18 @@ fn non_emptying_transaction_different_blocks_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 11
 fn non_emptying_transaction_different_blocks_insufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1130,18 +1122,18 @@ fn non_emptying_transaction_different_blocks_insufficient_reserve_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(20 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 12
 fn non_emptying_transaction_different_blocks_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1160,18 +1152,18 @@ fn non_emptying_transaction_different_blocks_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 13
 fn delegation_non_emptying_same_block_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1190,7 +1182,7 @@ fn delegation_non_emptying_same_block_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(2 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1198,13 +1190,13 @@ fn delegation_non_emptying_same_block_insufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 14
 fn delegation_non_emptying_same_block_insufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1223,7 +1215,7 @@ fn delegation_non_emptying_same_block_insufficient_reserve_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(15 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1231,13 +1223,13 @@ fn delegation_non_emptying_same_block_insufficient_reserve_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 15
 fn delegation_non_emptying_same_block_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1256,7 +1248,7 @@ fn delegation_non_emptying_same_block_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(2 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1264,13 +1256,13 @@ fn delegation_non_emptying_same_block_sufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 16
 fn invalid_delegation_non_emptying_same_block_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1305,7 +1297,7 @@ fn invalid_delegation_non_emptying_same_block_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2, tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1313,13 +1305,13 @@ fn invalid_delegation_non_emptying_same_block_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 17
 fn delegation_non_emptying_different_blocks_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1339,7 +1331,7 @@ fn delegation_non_emptying_different_blocks_insufficient_inputs() -> (
     ]);
 
     let signer_addr = PrivateKeySigner::from_bytes(&sender).unwrap().address();
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (signer_addr, U256::from(2 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1347,13 +1339,13 @@ fn delegation_non_emptying_different_blocks_insufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 18
 fn delegation_non_emptying_different_blocks_insufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1373,7 +1365,7 @@ fn delegation_non_emptying_different_blocks_insufficient_reserve_inputs() -> (
     ]);
 
     let signer_addr = PrivateKeySigner::from_bytes(&sender).unwrap().address();
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (signer_addr, U256::from(15 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1381,13 +1373,13 @@ fn delegation_non_emptying_different_blocks_insufficient_reserve_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 19
 fn delegation_non_emptying_different_blocks_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1407,7 +1399,7 @@ fn delegation_non_emptying_different_blocks_sufficient_inputs() -> (
     ]);
 
     let signer_addr = PrivateKeySigner::from_bytes(&sender).unwrap().address();
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (signer_addr, U256::from(2 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1415,13 +1407,13 @@ fn delegation_non_emptying_different_blocks_sufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 20
 fn invalid_delegation_non_emptying_different_blocks_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1456,7 +1448,7 @@ fn invalid_delegation_non_emptying_different_blocks_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1464,13 +1456,13 @@ fn invalid_delegation_non_emptying_different_blocks_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 21
 fn invalid_delegation_non_emptying_different_blocks_inputs_2() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1506,7 +1498,7 @@ fn invalid_delegation_non_emptying_different_blocks_inputs_2() -> (
     ]);
 
     let signer_addr = PrivateKeySigner::from_bytes(&sender).unwrap().address();
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (signer_addr, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1514,13 +1506,13 @@ fn invalid_delegation_non_emptying_different_blocks_inputs_2() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 22
 fn emptying_txn_and_delegation_same_block_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1539,7 +1531,7 @@ fn emptying_txn_and_delegation_same_block_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(2 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1547,13 +1539,13 @@ fn emptying_txn_and_delegation_same_block_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 23
 fn emptying_txn_with_value_and_delegation_same_block_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1572,7 +1564,7 @@ fn emptying_txn_with_value_and_delegation_same_block_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1580,13 +1572,13 @@ fn emptying_txn_with_value_and_delegation_same_block_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 24
 fn sufficient_balance_emptying_txn_with_value_and_delegation_same_block_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1605,7 +1597,7 @@ fn sufficient_balance_emptying_txn_with_value_and_delegation_same_block_inputs()
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1613,13 +1605,13 @@ fn sufficient_balance_emptying_txn_with_value_and_delegation_same_block_inputs()
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 25
 fn delegation_undelegation_insufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1648,7 +1640,7 @@ fn delegation_undelegation_insufficient_reserve_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(15 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1656,13 +1648,13 @@ fn delegation_undelegation_insufficient_reserve_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 26
 fn delegation_undelegation_sufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1691,7 +1683,7 @@ fn delegation_undelegation_sufficient_reserve_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1699,13 +1691,13 @@ fn delegation_undelegation_sufficient_reserve_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 27
 fn delegation_and_transfer_same_transaction_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1729,18 +1721,18 @@ fn delegation_and_transfer_same_transaction_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(2 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 28
 fn delegation_and_transfer_same_transaction_insufficient_inputs_2() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1764,18 +1756,18 @@ fn delegation_and_transfer_same_transaction_insufficient_inputs_2() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(15 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 29
 fn delegation_and_transfer_same_transaction_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1799,18 +1791,18 @@ fn delegation_and_transfer_same_transaction_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(5 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 30
 fn prev_block_delegation_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1832,7 +1824,7 @@ fn prev_block_delegation_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1840,13 +1832,13 @@ fn prev_block_delegation_insufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 31
 fn prev_block_delegation_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1868,7 +1860,7 @@ fn prev_block_delegation_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1876,13 +1868,13 @@ fn prev_block_delegation_sufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 32
 fn emptying_and_delegation_preceding_blocks_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1903,7 +1895,7 @@ fn emptying_and_delegation_preceding_blocks_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1911,13 +1903,13 @@ fn emptying_and_delegation_preceding_blocks_insufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 33
 fn emptying_and_delegation_preceding_blocks_insufficient_reserve_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1939,7 +1931,7 @@ fn emptying_and_delegation_preceding_blocks_insufficient_reserve_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(15 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1947,13 +1939,13 @@ fn emptying_and_delegation_preceding_blocks_insufficient_reserve_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 34
 fn emptying_and_delegation_preceding_blocks_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -1975,7 +1967,7 @@ fn emptying_and_delegation_preceding_blocks_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -1983,13 +1975,13 @@ fn emptying_and_delegation_preceding_blocks_sufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 35
 fn multiple_non_emptying_same_block_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2012,19 +2004,19 @@ fn multiple_non_emptying_same_block_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2, tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(15 * ONE_ETHER))]),
         nonces: BTreeMap::from([(sender, 1)]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 36
 fn multiple_non_emptying_same_block_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2047,19 +2039,19 @@ fn multiple_non_emptying_same_block_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2, tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(15 * ONE_ETHER))]),
         nonces: BTreeMap::from([(sender, 1)]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 37
 fn multiple_non_emptying_different_blocks_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2085,18 +2077,18 @@ fn multiple_non_emptying_different_blocks_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3, tx4]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(15 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 38
 fn multiple_non_emptying_different_blocks_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2121,18 +2113,18 @@ fn multiple_non_emptying_different_blocks_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx3, tx4]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([(sender, U256::from(15 * ONE_ETHER))]),
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 39
 fn emptying_non_emptying_delegation_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2154,7 +2146,7 @@ fn emptying_non_emptying_delegation_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2, tx3]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(5 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -2162,13 +2154,13 @@ fn emptying_non_emptying_delegation_insufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 40
 fn emptying_delegation_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2187,7 +2179,7 @@ fn emptying_delegation_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(15 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -2195,13 +2187,13 @@ fn emptying_delegation_sufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 41
 fn invalid_delegation_non_emptying_sufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2235,7 +2227,7 @@ fn invalid_delegation_non_emptying_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(10 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -2243,13 +2235,13 @@ fn invalid_delegation_non_emptying_sufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }
 
 // 42
 fn invalid_delegation_non_emptying_insufficient_inputs() -> (
     BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
-    NopStateBackend,
+    NopExecutionStateRead,
 ) {
     let signer = S1;
 
@@ -2285,7 +2277,7 @@ fn invalid_delegation_non_emptying_insufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
-    let state_backend = NopStateBackend {
+    let state_read = NopExecutionStateRead {
         balances: BTreeMap::from([
             (sender, U256::from(15 * ONE_ETHER)),
             (bundler, U256::from(ONE_ETHER)),
@@ -2293,5 +2285,5 @@ fn invalid_delegation_non_emptying_insufficient_inputs() -> (
         ..Default::default()
     };
 
-    (txs, state_backend)
+    (txs, state_read)
 }

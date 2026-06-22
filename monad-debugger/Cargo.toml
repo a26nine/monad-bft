@@ -3,6 +3,9 @@ name = "monad-debugger"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.cargo-shear]
+ignored = ["getrandom"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 # this is necessary for criterion bench options
@@ -18,11 +21,11 @@ monad-chain-config = { workspace = true }
 monad-consensus = { workspace = true }
 monad-consensus-types = { workspace = true }
 monad-crypto = { workspace = true }
+monad-execution-state-read = { workspace = true }
 monad-executor-glue = { workspace = true }
 monad-mock-swarm = { workspace = true }
 monad-router-scheduler = { workspace = true }
 monad-state = { workspace = true }
-monad-state-backend = { workspace = true }
 monad-testutil = { workspace = true }
 monad-transformer = { workspace = true }
 monad-types = { workspace = true }
@@ -37,6 +40,3 @@ getrandom = { workspace = true, features = ["js"] }
 hex = { workspace = true }
 serde_json = { workspace = true }
 wasm-bindgen = { workspace = true }
-
-[package.metadata.cargo-shear]
-ignored = ["getrandom"]

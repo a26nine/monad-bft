@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -28,7 +29,7 @@ use monad_chain_config::MonadChainConfig;
 use monad_consensus_types::validator_data::ValidatorsConfigFile;
 use monad_control_panel::TracingReload;
 use monad_keystore::keystore::Keystore;
-use monad_node_config::{ForkpointConfig, MonadNodeConfig, ValidatorsConfigType};
+use monad_node_config::{ForkpointConfig, MonadNodeConfig, PrometheusConfig, ValidatorsConfigType};
 use monad_secp::KeyPair;
 use monad_types::Round;
 use reqwest::{blocking::Client, Url};
@@ -45,6 +46,12 @@ use crate::{cli::Cli, error::NodeSetupError};
 const REMOTE_FORKPOINT_URL_ENV: &str = "REMOTE_FORKPOINT_URL";
 const REMOTE_VALIDATORS_URL_ENV: &str = "REMOTE_VALIDATORS_URL";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetricsConfig {
+    pub addr: String,
+    pub labels: BTreeMap<String, String>,
+}
+
 pub struct NodeState {
     pub node_config: MonadNodeConfig,
     pub node_config_path: PathBuf,
@@ -59,6 +66,8 @@ pub struct NodeState {
     pub forkpoint_path: PathBuf,
     pub validators_path: PathBuf,
     pub wal_path: PathBuf,
+    pub wal_chunks: u64,
+    pub wal_chunk_size_bytes: u64,
     pub ledger_path: PathBuf,
     pub mempool_ipc_path: PathBuf,
     pub control_panel_ipc_path: PathBuf,
@@ -67,6 +76,7 @@ pub struct NodeState {
     pub triedb_path: PathBuf,
     pub persisted_peers_path: PathBuf,
 
+    pub metrics: Option<MetricsConfig>,
     pub otel_endpoint_interval: Option<(String, Duration)>,
     pub pprof: String,
     pub reload_handle: Box<dyn TracingReload>,
@@ -85,14 +95,16 @@ impl NodeState {
             validators_path: validators_config_path,
             devnet_chain_config_override: maybe_devnet_chain_config_override_path,
             wal_path,
+            wal_chunks,
+            wal_chunk_size_bytes,
             ledger_path,
             mempool_ipc_path,
             triedb_path,
             control_panel_ipc_path,
             statesync_ipc_path,
             statesync_sq_thread_cpu,
-            keystore_password,
             otel_endpoint,
+            keystore_password,
             record_metrics_interval_seconds,
             pprof,
             manytrace_socket,
@@ -126,6 +138,7 @@ impl NodeState {
 
         let node_config: MonadNodeConfig =
             toml::from_str(&std::fs::read_to_string(&node_config_path)?)?;
+        let metrics = parse_metrics_config(node_config.prometheus.as_ref())?;
 
         if !matches!(
             forkpoint_config_path.extension().and_then(OsStr::to_str),
@@ -154,20 +167,6 @@ impl NodeState {
         let chain_config =
             MonadChainConfig::new(node_config.chain_id, devnet_chain_config_override)?;
 
-        let wal_path = wal_path.with_file_name(format!(
-            "{}_{}",
-            wal_path
-                .file_name()
-                .expect("no wal file name")
-                .to_owned()
-                .into_string()
-                .expect("invalid wal path"),
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .expect("time went backwards")
-                .as_millis()
-        ));
-
         let otel_endpoint_interval = match (otel_endpoint, record_metrics_interval_seconds) {
             (Some(otel_endpoint), Some(record_metrics_interval_seconds)) => Some((
                 otel_endpoint,
@@ -191,6 +190,8 @@ impl NodeState {
             forkpoint_path: forkpoint_config_path,
             validators_path: validators_config_path,
             wal_path,
+            wal_chunks,
+            wal_chunk_size_bytes,
             ledger_path,
             triedb_path,
             mempool_ipc_path,
@@ -198,6 +199,7 @@ impl NodeState {
             statesync_ipc_path,
             statesync_sq_thread_cpu,
 
+            metrics,
             otel_endpoint_interval,
             pprof,
             reload_handle,
@@ -256,6 +258,40 @@ impl NodeState {
             Ok((Box::new(reload_handle), None))
         }
     }
+}
+
+fn parse_metrics_config(
+    config: Option<&PrometheusConfig>,
+) -> Result<Option<MetricsConfig>, NodeSetupError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    for key in config.labels.keys() {
+        if !is_valid_label_key(key) {
+            return Err(NodeSetupError::Custom {
+                kind: ErrorKind::InvalidValue,
+                msg: format!(
+                    "invalid prometheus label key {key:?}; expected [a-zA-Z_][a-zA-Z0-9_]*"
+                ),
+            });
+        }
+    }
+
+    Ok(Some(MetricsConfig {
+        addr: config.bind_addr.clone(),
+        labels: config.labels.clone(),
+    }))
+}
+
+fn is_valid_label_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn fetch_local_configs(
@@ -376,15 +412,33 @@ fn get_latest_configs(
 
             // if remote config is more recent, use that over local config
             if remote_forkpoint_round > local_forkpoint_round + remote_configs_threshold {
-                info!(
-                    ?remote_forkpoint_round,
-                    ?local_forkpoint_round,
-                    "local forkpoint over {} rounds older than remote forkpoint, using remote configs",
-                    remote_configs_threshold.0
-                );
+                let maybe_missing_epoch =
+                    remote_forkpoint_config
+                        .validator_sets
+                        .iter()
+                        .find_map(|locked_epoch| {
+                            remote_validators_config
+                                .get_validator_set(&locked_epoch.epoch)
+                                .is_none()
+                                .then_some(locked_epoch.epoch)
+                        });
+                if let Some(epoch) = maybe_missing_epoch {
+                    info!(
+                        "remote validators config missing validator set for remote forkpoint at epoch {}, using local configs",
+                        epoch
+                    );
+                    return Ok((local_forkpoint_config, local_validators_config));
+                } else {
+                    info!(
+                        ?remote_forkpoint_round,
+                        ?local_forkpoint_round,
+                        "local forkpoint over {} rounds older than remote forkpoint, using remote configs",
+                        remote_configs_threshold
+                    );
 
-                replace_local_configs(&remote_forkpoint_config, &remote_validators_config);
-                return Ok((remote_forkpoint_config, remote_validators_config));
+                    replace_local_configs(&remote_forkpoint_config, &remote_validators_config);
+                    return Ok((remote_forkpoint_config, remote_validators_config));
+                }
             }
 
             info!(

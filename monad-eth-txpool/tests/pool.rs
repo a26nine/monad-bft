@@ -35,8 +35,7 @@ use monad_consensus_types::{
     payload::RoundSignature,
 };
 use monad_crypto::{
-    certificate_signature::{CertificateKeyPair, PubKey},
-    NopKeyPair, NopPubKey, NopSignature,
+    certificate_signature::CertificateKeyPair, NopKeyPair, NopPubKey, NopSignature,
 };
 use monad_eth_block_policy::{validation::TFM_MAX_GAS_LIMIT, EthBlockPolicy};
 use monad_eth_block_validator::EthBlockValidator;
@@ -49,11 +48,17 @@ use monad_eth_txpool::{
     EthTxPoolMetrics, PoolTxKind, TrackedTxLimitsConfig,
 };
 use monad_eth_txpool_types::EthTxPoolSnapshot;
-use monad_state_backend::{AccountState, InMemoryBlockState, InMemoryState, InMemoryStateInner};
+use monad_execution_state_read::{
+    AccountState, InMemoryBlockState, InMemoryState, InMemoryStateInner,
+};
 use monad_testutil::signing::MockSignatures;
 use monad_types::{Balance, Epoch, NodeId, Round, SeqNum, GENESIS_ROUND, GENESIS_SEQ_NUM};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tracing_test::traced_test;
+
+use self::common::dummy_node_id;
+
+mod common;
 
 const EXECUTION_DELAY: u64 = 4;
 const BASE_FEE_PER_GAS: u64 = 100_000_000_000;
@@ -65,10 +70,18 @@ const PROPOSAL_SIZE_LIMIT: u64 = 4_000_000;
 
 type SignatureType = NopSignature;
 type SignatureCollectionType = MockSignatures<SignatureType>;
-type StateBackendType = InMemoryState<SignatureType, SignatureCollectionType>;
+type ExecutionStateReadType = InMemoryState<SignatureType, SignatureCollectionType>;
+type BlockPolicyType =
+    EthBlockPolicy<SignatureType, SignatureCollectionType, MockChainConfig, MockChainRevision>;
+type TxPoolType = EthTxPool<
+    SignatureType,
+    SignatureCollectionType,
+    ExecutionStateReadType,
+    MockChainConfig,
+    MockChainRevision,
+>;
 
-fn make_test_block_policy(
-) -> EthBlockPolicy<SignatureType, SignatureCollectionType, MockChainConfig, MockChainRevision> {
+fn make_test_block_policy() -> BlockPolicyType {
     EthBlockPolicy::new(GENESIS_SEQ_NUM, EXECUTION_DELAY)
 }
 
@@ -82,12 +95,17 @@ enum TxPoolTestEvent<'a> {
         txs: Vec<&'a TxEnvelope>,
         should_insert: bool,
     },
+    InsertTxsWithKind {
+        txs: Vec<(&'a TxEnvelope, PoolTxKind<NopPubKey>)>,
+        should_insert: bool,
+    },
     CreateProposal {
         base_fee: u64,
         tx_limit: usize,
         gas_limit: u64,
         byte_limit: u64,
         expected_txs: Vec<&'a TxEnvelope>,
+        expected_sender_gas: Option<Vec<(NodeId<NopPubKey>, u64)>>,
         add_to_blocktree: bool,
     },
     CommitPendingBlocks {
@@ -104,7 +122,7 @@ enum TxPoolTestEvent<'a> {
                 &mut EthTxPool<
                     SignatureType,
                     SignatureCollectionType,
-                    StateBackendType,
+                    ExecutionStateReadType,
                     MockChainConfig,
                     MockChainRevision,
                 >,
@@ -114,24 +132,13 @@ enum TxPoolTestEvent<'a> {
 }
 
 fn run_custom_iter<const N: usize>(
-    mut pool: EthTxPool<
-        SignatureType,
-        SignatureCollectionType,
-        StateBackendType,
-        MockChainConfig,
-        MockChainRevision,
-    >,
-    mut eth_block_policy: EthBlockPolicy<
-        SignatureType,
-        SignatureCollectionType,
-        MockChainConfig,
-        MockChainRevision,
-    >,
+    mut pool: TxPoolType,
+    mut eth_block_policy: BlockPolicyType,
     nonces_override: Option<BTreeMap<Address, AccountState>>,
     events: [TxPoolTestEvent<'_>; N],
     owned: bool,
 ) {
-    let state_backend = {
+    let mut state_read = {
         let nonces = if let Some(nonces) = nonces_override {
             nonces
         } else {
@@ -151,6 +158,13 @@ fn run_custom_iter<const N: usize>(
                     } => txs
                         .into_par_iter()
                         .map(|tx| tx.recover_signer().expect("signer is recoverable"))
+                        .collect(),
+                    TxPoolTestEvent::InsertTxsWithKind {
+                        txs,
+                        should_insert: _,
+                    } => txs
+                        .iter()
+                        .map(|(tx, _)| tx.recover_signer().expect("signer is recoverable"))
                         .collect(),
                     _ => vec![],
                 })
@@ -197,14 +211,16 @@ fn run_custom_iter<const N: usize>(
                     pool.insert_txs(
                         &mut event_tracker,
                         &eth_block_policy,
-                        &state_backend,
+                        &mut state_read,
                         &MockChainConfig::DEFAULT,
                         vec![(
                             tx.clone(),
                             if owned {
                                 PoolTxKind::owned_default()
                             } else {
-                                PoolTxKind::Forwarded
+                                PoolTxKind::Forwarded {
+                                    sender: dummy_node_id(),
+                                }
                             },
                         )],
                         |inserted_tx| {
@@ -250,7 +266,7 @@ fn run_custom_iter<const N: usize>(
                 pool.insert_txs(
                     &mut event_tracker,
                     &eth_block_policy,
-                    &state_backend,
+                    &mut state_read,
                     &MockChainConfig::DEFAULT,
                     txs.into_iter()
                         .map(ToOwned::to_owned)
@@ -261,7 +277,9 @@ fn run_custom_iter<const N: usize>(
                                 if owned {
                                     PoolTxKind::owned_default()
                                 } else {
-                                    PoolTxKind::Forwarded
+                                    PoolTxKind::Forwarded {
+                                        sender: dummy_node_id(),
+                                    }
                                 },
                             )
                         })
@@ -285,16 +303,34 @@ fn run_custom_iter<const N: usize>(
                     "pool size tx insertion count mismatch"
                 );
             }
+            TxPoolTestEvent::InsertTxsWithKind { txs, should_insert } => {
+                let mut num_inserted = 0usize;
+                let num_expected = if should_insert { txs.len() } else { 0 };
+
+                pool.insert_txs(
+                    &mut event_tracker,
+                    &eth_block_policy,
+                    &mut state_read,
+                    &MockChainConfig::DEFAULT,
+                    txs.into_iter()
+                        .map(|(tx, kind)| (recover_tx(tx.to_owned()), kind))
+                        .collect(),
+                    |_| num_inserted += 1,
+                );
+
+                assert_eq!(num_inserted, num_expected, "tx insertion count mismatch");
+            }
             TxPoolTestEvent::CreateProposal {
                 base_fee,
                 tx_limit,
                 gas_limit,
                 byte_limit,
                 expected_txs,
+                expected_sender_gas,
                 add_to_blocktree,
             } => {
                 let mock_keypair = NopKeyPair::from_bytes(&mut [5_u8; 32]).unwrap();
-                let encoded_txns = pool
+                let proposal = pool
                     .create_proposal(
                         &mut event_tracker,
                         Epoch(1),
@@ -306,16 +342,15 @@ fn run_custom_iter<const N: usize>(
                         byte_limit,
                         [0_u8; 20],
                         GENESIS_TIMESTAMP + current_seq_num as u128,
-                        NodeId::new(NopPubKey::from_bytes(&[0_u8; 32]).unwrap()),
+                        dummy_node_id(),
                         RoundSignature::new(Round(0), &mock_keypair),
                         pending_blocks.iter().cloned().collect_vec(),
                         &eth_block_policy,
-                        &state_backend,
+                        &mut state_read,
                         &MockChainConfig::DEFAULT,
                     )
                     .expect("create proposal succeeds");
-
-                let decoded_txns = encoded_txns.body.transactions;
+                let decoded_txns = proposal.proposed_execution_inputs.body.transactions;
 
                 let expected_txs: Vec<_> = expected_txs.into_iter().cloned().collect();
 
@@ -328,6 +363,14 @@ fn run_custom_iter<const N: usize>(
                         .zip_longest(expected_txs.iter())
                         .collect_vec()
                 );
+
+                if let Some(expected_sender_gas) = expected_sender_gas {
+                    assert_eq!(
+                        proposal.sender_gas,
+                        BTreeMap::from_iter(expected_sender_gas),
+                        "create_proposal sender gas does not match expected",
+                    );
+                }
 
                 let block = generate_block_with_txs(
                     Round(current_round),
@@ -353,7 +396,7 @@ fn run_custom_iter<const N: usize>(
                         MockChainConfig,
                         MockChainRevision,
                     >,
-                    StateBackendType,
+                    ExecutionStateReadType,
                     MockChainConfig,
                     MockChainRevision,
                 >::validate(
@@ -385,7 +428,7 @@ fn run_custom_iter<const N: usize>(
                         .pop_front()
                         .expect("missing block in blocktree");
 
-                    BlockPolicy::<_, _, _, StateBackendType, _, _>::update_committed_block(
+                    BlockPolicy::<_, _, _, ExecutionStateReadType, _, _>::update_committed_block(
                         &mut eth_block_policy,
                         &block,
                     );
@@ -409,7 +452,7 @@ fn run_custom_iter<const N: usize>(
                 let mut nonces = eth_block_policy
                     .get_account_base_nonces(
                         SeqNum(current_seq_num),
-                        &state_backend,
+                        &mut state_read,
                         &pending_blocks.iter().collect_vec(),
                         [&address].into_iter(),
                     )
@@ -436,7 +479,7 @@ fn run_custom<const N: usize>(
     pool_generator: impl Fn() -> EthTxPool<
         SignatureType,
         SignatureCollectionType,
-        StateBackendType,
+        ExecutionStateReadType,
         MockChainConfig,
         MockChainRevision,
     >,
@@ -471,6 +514,14 @@ fn run_simple<const N: usize>(account: &[B256], events: [TxPoolTestEvent<'_>; N]
     );
 }
 
+fn make_forwarded_test_txs(gas_limits: impl IntoIterator<Item = u64>) -> Vec<TxEnvelope> {
+    gas_limits
+        .into_iter()
+        .enumerate()
+        .map(|(offset, gas_limit)| make_legacy_tx(S1, BASE_FEE + 1, gas_limit, offset as u64, 0))
+        .collect()
+}
+
 #[test]
 #[traced_test]
 fn test_insert_tx_exceeds_gas_limit() {
@@ -489,6 +540,7 @@ fn test_insert_tx_exceeds_gas_limit() {
                 gas_limit: PROPOSAL_GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -513,6 +565,7 @@ fn test_create_proposal_with_insufficient_tx_limit() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::Block(Arc::new(|pool| {
@@ -542,6 +595,7 @@ fn test_create_partial_proposal_with_insufficient_gas_limit() {
                 gas_limit: 200_000,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::Block(Arc::new(|pool| {
@@ -570,6 +624,7 @@ fn test_basic_price_priority() {
                 gas_limit: GAS_LIMIT * 3,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2, &tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::Block(Arc::new(|pool| {
@@ -598,6 +653,7 @@ fn test_resubmit_with_same_price() {
                 gas_limit: GAS_LIMIT * 2,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -623,6 +679,7 @@ fn test_resubmit_with_better_price() {
                 gas_limit: GAS_LIMIT * 3,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -658,6 +715,7 @@ fn nontrivial_example() {
                 gas_limit: 1024 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx7, &tx8, &tx9, &tx4, &tx2, &tx5, &tx3, &tx6],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -690,6 +748,7 @@ fn another_non_trivial_example() {
                 gas_limit: 1024 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx5, &tx6, &tx3, &tx2, &tx4],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -730,6 +789,7 @@ fn attacker_tries_to_include_transaction_with_large_gas_limit_to_exit_proposal_c
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2, &tx3, &tx4, &tx5, &tx6, &tx7, &tx8, &tx9, &tx10, &tx11],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -773,6 +833,7 @@ fn suboptimal_block() {
                     gas_limit: TFM_MAX_GAS_LIMIT,
                     byte_limit: PROPOSAL_SIZE_LIMIT,
                     expected_txs: vec![&tx11],
+                    expected_sender_gas: None,
                     add_to_blocktree: true,
                 },
             ],
@@ -824,6 +885,7 @@ fn insertion_order() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx3, &tx5, &tx7, &tx9, &tx2, &tx4, &tx6, &tx8, &tx10],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -850,6 +912,7 @@ fn test_zero_nonce_included_in_block() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -876,6 +939,7 @@ fn test_nonce_gap() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -904,6 +968,7 @@ fn test_intermediary_nonce_gap() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -940,6 +1005,7 @@ fn test_nonce_exists_in_committed_block() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -969,6 +1035,7 @@ fn test_insert_unknown_account() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1001,6 +1068,7 @@ fn test_insert_legacy_low_balance() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1029,6 +1097,7 @@ fn test_insert_legacy_low_balance() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1052,6 +1121,7 @@ fn test_insert_legacy_low_balance() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1084,6 +1154,7 @@ fn test_insert_1559_low_balance() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1110,6 +1181,7 @@ fn test_insert_1559_low_balance() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1137,6 +1209,7 @@ fn test_insert_1559_low_balance() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1167,6 +1240,7 @@ fn test_nonce_exists_in_pending_block() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::InsertTxs {
@@ -1179,6 +1253,7 @@ fn test_nonce_exists_in_pending_block() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx3],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1207,6 +1282,7 @@ fn test_combine_nonces_of_blocks() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CommitPendingBlocks {
@@ -1223,6 +1299,7 @@ fn test_combine_nonces_of_blocks() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::InsertTxs {
@@ -1235,6 +1312,7 @@ fn test_combine_nonces_of_blocks() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx3],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1262,6 +1340,7 @@ fn test_nonce_gap_maintained_across_proposals() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: false,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1270,6 +1349,7 @@ fn test_nonce_gap_maintained_across_proposals() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: false,
             },
             TxPoolTestEvent::InsertTxs {
@@ -1283,6 +1363,7 @@ fn test_nonce_gap_maintained_across_proposals() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2, &tx3, &tx4],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1291,6 +1372,7 @@ fn test_nonce_gap_maintained_across_proposals() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1318,6 +1400,7 @@ fn test_nonce_gap_maintained_across_commit() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CommitPendingBlocks {
@@ -1335,6 +1418,7 @@ fn test_nonce_gap_maintained_across_commit() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx3, &tx4],
+                expected_sender_gas: None,
                 add_to_blocktree: false,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1343,6 +1427,7 @@ fn test_nonce_gap_maintained_across_commit() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx3, &tx4],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1351,6 +1436,7 @@ fn test_nonce_gap_maintained_across_commit() {
                 gas_limit: 10 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1421,6 +1507,7 @@ fn test_same_account_priority_fee_ordering() {
                     gas_limit: GAS_LIMIT * 4,
                     byte_limit: PROPOSAL_SIZE_LIMIT,
                     expected_txs: vec![&tx_d],
+                    expected_sender_gas: None,
                     add_to_blocktree: false,
                 },
             ],
@@ -1448,6 +1535,7 @@ fn test_different_account_priority_fee_ordering() {
                         gas_limit: GAS_LIMIT * 2,
                         byte_limit: PROPOSAL_SIZE_LIMIT,
                         expected_txs: vec![&tx_higher, &tx_lower],
+                        expected_sender_gas: None,
                         add_to_blocktree: false,
                     },
                 ],
@@ -1475,6 +1563,7 @@ fn test_eip1559_proposal_base_fee() {
                     gas_limit: 2 * GAS_LIMIT,
                     byte_limit: PROPOSAL_SIZE_LIMIT,
                     expected_txs: vec![&tx1, &tx2],
+                    expected_sender_gas: None,
                     add_to_blocktree: false,
                 },
                 TxPoolTestEvent::CreateProposal {
@@ -1483,6 +1572,7 @@ fn test_eip1559_proposal_base_fee() {
                     gas_limit: 2 * GAS_LIMIT,
                     byte_limit: PROPOSAL_SIZE_LIMIT,
                     expected_txs: vec![&tx2, &tx1],
+                    expected_sender_gas: None,
                     add_to_blocktree: false,
                 },
             ],
@@ -1522,6 +1612,7 @@ fn test_missing_chain_id() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1594,6 +1685,7 @@ fn test_exceed_proposal_byte_limit() {
                 gas_limit: PROPOSAL_GAS_LIMIT,
                 byte_limit: PROPOSAL_BYTE_LIMIT as u64 - 1,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1602,6 +1694,7 @@ fn test_exceed_proposal_byte_limit() {
                 gas_limit: PROPOSAL_GAS_LIMIT,
                 byte_limit: PROPOSAL_BYTE_LIMIT as u64,
                 expected_txs: vec![&tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1610,6 +1703,7 @@ fn test_exceed_proposal_byte_limit() {
                 gas_limit: PROPOSAL_GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
         ],
@@ -1682,6 +1776,7 @@ fn test_proposal_tx_low_base_fee() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![],
+                expected_sender_gas: None,
                 add_to_blocktree: false,
             },
             TxPoolTestEvent::CreateProposal {
@@ -1690,6 +1785,7 @@ fn test_proposal_tx_low_base_fee() {
                 gas_limit: GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1],
+                expected_sender_gas: None,
                 add_to_blocktree: false,
             },
         ],
@@ -1756,6 +1852,7 @@ fn test_eviction_policy() {
                     } else {
                         vec![&tx_d, &tx_a, &tx_b]
                     },
+                    expected_sender_gas: None,
                     add_to_blocktree: true,
                 },
             ],
@@ -1798,6 +1895,7 @@ fn test_eip7702_valid_authorization_changes_nonce() {
                     &tx1,
                     // Txpool sequencer does not resolve authorization nonces and thus does not sequence tx2 in same block
                 ],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -1814,6 +1912,7 @@ fn test_eip7702_valid_authorization_changes_nonce() {
                 gas_limit: 2 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -1856,6 +1955,7 @@ fn test_eip7702_authorization_nonce_higher() {
                 gas_limit: 2 * GAS_LIMIT_EIP_7702,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -1896,6 +1996,7 @@ fn test_eip7702_authorization_nonce_equal() {
                 gas_limit: GAS_LIMIT + GAS_LIMIT_EIP_7702,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -1940,6 +2041,7 @@ fn test_eip7702_authorization_nonce_lower() {
                 gas_limit: 3 * GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx1, &tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -1988,6 +2090,7 @@ fn test_eip7702_authorizations_with_conflicting_txs() {
                 gas_limit: GAS_LIMIT_EIP_7702 * 100,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx0],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -2004,6 +2107,7 @@ fn test_eip7702_authorizations_with_conflicting_txs() {
                 gas_limit: GAS_LIMIT_EIP_7702 * 100,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&tx2],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::AssertNonce {
@@ -2093,6 +2197,7 @@ fn test_eip_7702_sponsor_with_1559() {
                 gas_limit: PROPOSAL_GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: txs.iter().step_by(2).collect(),
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CreateProposal {
@@ -2101,6 +2206,7 @@ fn test_eip_7702_sponsor_with_1559() {
                 gas_limit: PROPOSAL_GAS_LIMIT,
                 byte_limit: PROPOSAL_SIZE_LIMIT,
                 expected_txs: vec![&txs[1]],
+                expected_sender_gas: None,
                 add_to_blocktree: true,
             },
             TxPoolTestEvent::CommitPendingBlocks {
@@ -2111,5 +2217,195 @@ fn test_eip_7702_sponsor_with_1559() {
                 assert_eq!(pool.num_txs(), 9);
             })),
         ],
+    );
+}
+
+#[test]
+#[traced_test]
+fn test_forwarded_sender_gas_contributions_follow_pool_lifecycle() {
+    let sender1 = common::test_node_id(1);
+    let sender2 = common::test_node_id(2);
+    let sender3 = common::test_node_id(3);
+    let mut tracked_txs = make_forwarded_test_txs([100_000, 200_000, 300_000]).into_iter();
+    let tx1 = tracked_txs.next().unwrap();
+    let tx2 = tracked_txs.next().unwrap();
+    let tx3 = tracked_txs.next().unwrap();
+
+    run_custom_iter(
+        EthTxPool::default_testing(),
+        make_test_block_policy(),
+        Some(BTreeMap::from_iter([(
+            secret_to_eth_address(S1),
+            AccountState::max_balance(),
+        )])),
+        [
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![
+                    (&tx1, PoolTxKind::Forwarded { sender: sender1 }),
+                    (&tx2, PoolTxKind::Forwarded { sender: sender2 }),
+                    (&tx3, PoolTxKind::Forwarded { sender: sender3 }),
+                ],
+                should_insert: true,
+            },
+            TxPoolTestEvent::CreateProposal {
+                base_fee: BASE_FEE_PER_GAS,
+                tx_limit: 1,
+                gas_limit: PROPOSAL_GAS_LIMIT,
+                byte_limit: PROPOSAL_SIZE_LIMIT,
+                expected_txs: vec![&tx1],
+                expected_sender_gas: Some(vec![(sender1, tx1.gas_limit())]),
+                add_to_blocktree: true,
+            },
+            TxPoolTestEvent::CommitPendingBlocks {
+                num_blocks: 1,
+                expected_committed_seq_num: 1,
+            },
+            TxPoolTestEvent::CreateProposal {
+                base_fee: BASE_FEE_PER_GAS,
+                tx_limit: usize::MAX,
+                gas_limit: PROPOSAL_GAS_LIMIT,
+                byte_limit: PROPOSAL_SIZE_LIMIT,
+                expected_txs: vec![&tx2, &tx3],
+                expected_sender_gas: Some(vec![
+                    (sender2, tx2.gas_limit()),
+                    (sender3, tx3.gas_limit()),
+                ]),
+                add_to_blocktree: false,
+            },
+        ],
+        false,
+    );
+}
+
+#[test]
+#[traced_test]
+fn test_forwarded_sender_gas_contributions_preserve_sender_on_duplicate_drop() {
+    let sender = common::test_node_id(4);
+    let tx = make_forwarded_test_txs([100_000])
+        .into_iter()
+        .next()
+        .unwrap();
+
+    run_custom_iter(
+        EthTxPool::default_testing(),
+        make_test_block_policy(),
+        Some(BTreeMap::from_iter([(
+            secret_to_eth_address(S1),
+            AccountState::max_balance(),
+        )])),
+        [
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![(&tx, PoolTxKind::Forwarded { sender })],
+                should_insert: true,
+            },
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![(&tx, PoolTxKind::Forwarded { sender })],
+                should_insert: false,
+            },
+            TxPoolTestEvent::CreateProposal {
+                base_fee: BASE_FEE_PER_GAS,
+                tx_limit: usize::MAX,
+                gas_limit: PROPOSAL_GAS_LIMIT,
+                byte_limit: PROPOSAL_SIZE_LIMIT,
+                expected_txs: vec![&tx],
+                expected_sender_gas: Some(vec![(sender, tx.gas_limit())]),
+                add_to_blocktree: false,
+            },
+        ],
+        false,
+    );
+}
+
+#[test]
+#[traced_test]
+fn test_forwarded_sender_gas_contributions_preserve_original_sender_on_duplicate_receive() {
+    let sender1 = common::test_node_id(5);
+    let sender2 = common::test_node_id(6);
+    let tx = make_forwarded_test_txs([100_000])
+        .into_iter()
+        .next()
+        .unwrap();
+
+    run_custom_iter(
+        EthTxPool::default_testing(),
+        make_test_block_policy(),
+        Some(BTreeMap::from_iter([(
+            secret_to_eth_address(S1),
+            AccountState::max_balance(),
+        )])),
+        [
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![(&tx, PoolTxKind::Forwarded { sender: sender1 })],
+                should_insert: true,
+            },
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![(&tx, PoolTxKind::Forwarded { sender: sender2 })],
+                should_insert: false,
+            },
+            TxPoolTestEvent::CreateProposal {
+                base_fee: BASE_FEE_PER_GAS,
+                tx_limit: usize::MAX,
+                gas_limit: PROPOSAL_GAS_LIMIT,
+                byte_limit: PROPOSAL_SIZE_LIMIT,
+                expected_txs: vec![&tx],
+                expected_sender_gas: Some(vec![(sender1, tx.gas_limit())]),
+                add_to_blocktree: false,
+            },
+        ],
+        false,
+    );
+}
+
+#[test]
+#[traced_test]
+fn test_forwarded_sender_gas_contributions_remove_replaced_forwarded_tx_after_same_batch_duplicates(
+) {
+    let sender = common::test_node_id(7);
+    let forwarded_tx = make_forwarded_test_txs([100_000])
+        .into_iter()
+        .next()
+        .unwrap();
+    let replacement_tx = make_legacy_tx(
+        S1,
+        BASE_FEE + 2,
+        forwarded_tx.gas_limit(),
+        forwarded_tx.nonce(),
+        0,
+    );
+
+    run_custom_iter(
+        EthTxPool::default_testing(),
+        make_test_block_policy(),
+        Some(BTreeMap::from_iter([(
+            secret_to_eth_address(S1),
+            AccountState::max_balance(),
+        )])),
+        [
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![(&forwarded_tx, PoolTxKind::Forwarded { sender })],
+                should_insert: true,
+            },
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![
+                    (&forwarded_tx, PoolTxKind::Forwarded { sender }),
+                    (&forwarded_tx, PoolTxKind::Forwarded { sender }),
+                ],
+                should_insert: false,
+            },
+            TxPoolTestEvent::InsertTxsWithKind {
+                txs: vec![(&replacement_tx, PoolTxKind::owned_default())],
+                should_insert: true,
+            },
+            TxPoolTestEvent::CreateProposal {
+                base_fee: BASE_FEE_PER_GAS,
+                tx_limit: usize::MAX,
+                gas_limit: PROPOSAL_GAS_LIMIT,
+                byte_limit: PROPOSAL_SIZE_LIMIT,
+                expected_txs: vec![&replacement_tx],
+                expected_sender_gas: Some(vec![]),
+                add_to_blocktree: false,
+            },
+        ],
+        false,
     );
 }

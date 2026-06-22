@@ -71,6 +71,29 @@ impl Round {
     pub fn as_u64(&self) -> u64 {
         self.0
     }
+
+    pub fn immediately_follows(self, previous_round: Self) -> bool {
+        previous_round
+            .as_u64()
+            .checked_add(1)
+            .is_some_and(|next_round| next_round == self.as_u64())
+    }
+
+    pub fn saturating_sub(self, count: Round) -> Self {
+        Round(self.0.saturating_sub(count.0))
+    }
+
+    pub fn checked_sub(self, count: Round) -> Option<Self> {
+        self.0.checked_sub(count.0).map(Round)
+    }
+
+    pub fn saturating_add(self, count: Round) -> Self {
+        Round(self.0.saturating_add(count.0))
+    }
+
+    pub fn checked_add(self, count: Round) -> Option<Self> {
+        self.0.checked_add(count.0).map(Round)
+    }
 }
 
 pub type Balance = U256;
@@ -133,11 +156,23 @@ impl FromStr for Round {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, RlpEncodable)]
 // A non-empty span of rounds
 pub struct RoundSpan {
     pub start: Round, // inclusive
     pub end: Round,   // exclusive
+}
+
+impl Decodable for RoundSpan {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let b = &mut alloy_rlp::Header::decode_bytes(buf, true)?;
+        let start = Round::decode(b)?;
+        let end = Round::decode(b)?;
+        if start >= end {
+            return Err(alloy_rlp::Error::Custom("RoundSpan requires start < end"));
+        }
+        Ok(Self { start, end })
+    }
 }
 
 impl RoundSpan {
@@ -161,6 +196,7 @@ impl RoundSpan {
     pub fn contains(&self, round: Round) -> bool {
         self.start <= round && round < self.end
     }
+
     pub fn overlaps(&self, other: &RoundSpan) -> bool {
         self.start < other.end && other.start < self.end
     }
@@ -432,6 +468,12 @@ impl<P: PubKey> NodeId<P> {
     }
 }
 
+impl<P: PubKey> From<P> for NodeId<P> {
+    fn from(pubkey: P) -> Self {
+        Self::new(pubkey)
+    }
+}
+
 impl<P: PubKey> Debug for NodeId<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         Debug::fmt(&self.0, f)
@@ -657,7 +699,10 @@ impl<S: Clone> Deserializable<S> for S {
 #[derive(Debug)]
 pub enum RouterTarget<P: PubKey> {
     Broadcast(Epoch),
-    Raptorcast(Epoch), // sharded raptor-aware broadcast
+    Raptorcast {
+        round: Round,
+        epoch: Epoch,
+    },
     PointToPoint(NodeId<P>),
     DirectPointToPoint(NodeId<P>),
     TcpPointToPoint {
@@ -817,7 +862,35 @@ impl<T, const N: usize> LimitedVec<T, N> {
     pub fn into_inner(self) -> Vec<T> {
         self.0
     }
+
+    /// Append `item` if the vector has not reached the capacity bound `N`.
+    /// Returns the rejected item on overflow so the caller can decide how to recover.
+    pub fn try_push(&mut self, item: T) -> Result<(), LimitedVecCapacityError<T>> {
+        if self.0.len() >= N {
+            return Err(LimitedVecCapacityError {
+                rejected: item,
+                capacity: N,
+            });
+        }
+        self.0.push(item);
+        Ok(())
+    }
 }
+
+/// Error returned by [`LimitedVec::try_push`] when the vector is already at capacity.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LimitedVecCapacityError<T> {
+    pub rejected: T,
+    pub capacity: usize,
+}
+
+impl<T> std::fmt::Display for LimitedVecCapacityError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LimitedVec at capacity {}", self.capacity)
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for LimitedVecCapacityError<T> {}
 
 impl<T: Encodable, const N: usize> Encodable for LimitedVec<T, N> {
     fn length(&self) -> usize {
@@ -851,9 +924,23 @@ impl<T, const N: usize> std::ops::Deref for LimitedVec<T, N> {
     }
 }
 
-impl<T, const N: usize> std::ops::DerefMut for LimitedVec<T, N> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl<T, I, const N: usize> std::ops::Index<I> for LimitedVec<T, N>
+where
+    Vec<T>: std::ops::Index<I>,
+{
+    type Output = <Vec<T> as std::ops::Index<I>>::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl<T, I, const N: usize> std::ops::IndexMut<I> for LimitedVec<T, N>
+where
+    Vec<T>: std::ops::IndexMut<I>,
+{
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        &mut self.0[index]
     }
 }
 
@@ -899,6 +986,40 @@ impl<T, const N: usize> IntoIterator for LimitedVec<T, N> {
     }
 }
 
+/// A `u64` that enforces a maximum value during construction and RLP deserialization.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BoundedU64<const MAX: u64>(u64);
+
+impl<const MAX: u64> BoundedU64<MAX> {
+    pub fn new(value: u64) -> Option<Self> {
+        if value > MAX {
+            return None;
+        }
+        Some(Self(value))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl<const MAX: u64> Encodable for BoundedU64<MAX> {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        self.0.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        self.0.length()
+    }
+}
+
+impl<const MAX: u64> Decodable for BoundedU64<MAX> {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let value = u64::decode(buf)?;
+        Self::new(value).ok_or(alloy_rlp::Error::Custom("BoundedU64 value exceeds maximum"))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use alloy_rlp::{Decodable, Encodable};
@@ -917,9 +1038,16 @@ mod test {
     #[test_case(SeqNum(100), Epoch(2), SeqNum(100); "sn_100_epoch_2")]
     #[test_case(SeqNum(199), Epoch(2), SeqNum(100); "sn_199_epoch_2")]
     #[test_case(SeqNum(200), Epoch(3), SeqNum(100); "sn_200_epoch_3")]
-
     fn test_epoch_conversion(seq_num: SeqNum, expected_epoch: Epoch, epoch_length: SeqNum) {
         assert_eq!(seq_num.to_epoch(epoch_length), expected_epoch);
+    }
+
+    #[test_case(Round(11), Round(10) => true; "normal_successor")]
+    #[test_case(Round(10), Round(10) => false; "same_round")]
+    #[test_case(Round(12), Round(10) => false; "not_immediate")]
+    #[test_case(Round::MAX, Round::MAX => false; "max_round_no_overflow")]
+    fn test_round_immediately_follows(round: Round, previous_round: Round) -> bool {
+        round.immediately_follows(previous_round)
     }
 
     #[test]
@@ -1023,5 +1151,66 @@ mod test {
 
         let decoded = LimitedVec::<u32, 0>::decode(&mut buf.as_slice()).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_limited_vec_try_push_within_capacity() {
+        let mut v: LimitedVec<u32, 3> = LimitedVec::default();
+        assert!(v.try_push(1).is_ok());
+        assert!(v.try_push(2).is_ok());
+        assert!(v.try_push(3).is_ok());
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.0, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_limited_vec_try_push_rejects_at_capacity() {
+        let mut v: LimitedVec<u32, 2> = LimitedVec::default();
+        v.try_push(1).unwrap();
+        v.try_push(2).unwrap();
+        let err = v.try_push(99).unwrap_err();
+        assert_eq!(err.rejected, 99);
+        assert_eq!(err.capacity, 2);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn test_limited_vec_try_push_zero_capacity() {
+        let mut v: LimitedVec<u32, 0> = LimitedVec::default();
+        let err = v.try_push(7).unwrap_err();
+        assert_eq!(err.rejected, 7);
+        assert_eq!(err.capacity, 0);
+    }
+
+    #[test]
+    fn test_round_span_rlp_roundtrip() {
+        let span = RoundSpan::new(Round(10), Round(20)).unwrap();
+        let mut buf = Vec::new();
+        span.encode(&mut buf);
+
+        let decoded = RoundSpan::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(span, decoded);
+    }
+
+    #[test]
+    fn test_round_span_rlp_rejects_start_eq_end() {
+        let invalid = RoundSpan {
+            start: Round(10),
+            end: Round(10),
+        };
+        let mut buf = Vec::new();
+        invalid.encode(&mut buf);
+        assert!(RoundSpan::decode(&mut buf.as_slice()).is_err());
+    }
+
+    #[test]
+    fn test_round_span_rlp_rejects_start_gt_end() {
+        let invalid = RoundSpan {
+            start: Round(20),
+            end: Round(10),
+        };
+        let mut buf = Vec::new();
+        invalid.encode(&mut buf);
+        assert!(RoundSpan::decode(&mut buf.as_slice()).is_err());
     }
 }

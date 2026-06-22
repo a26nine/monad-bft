@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use alloy_consensus::{
     constants::EMPTY_WITHDRAWALS, transaction::Recovered, TxEnvelope, EMPTY_OMMER_ROOT_HASH,
@@ -39,7 +39,7 @@ use monad_eth_block_policy::{
 };
 use monad_eth_txpool_types::{EthTxPoolDropReason, EthTxPoolInternalDropReason, EthTxPoolSnapshot};
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, ExtractEthAddress, ProposedEthHeader};
-use monad_state_backend::{StateBackend, StateBackendError};
+use monad_execution_state_read::{ExecutionStateRead, ExecutionStateReadError};
 use monad_system_calls::{SystemTransactionGenerator, SYSTEM_SENDER_ETH_ADDRESS};
 use monad_types::{DropTimer, Epoch, NodeId, Round, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
@@ -51,7 +51,11 @@ pub use self::{
     tracked::TrackedTxLimitsConfig,
     transaction::{max_eip2718_encoded_length, PoolTxKind},
 };
-use self::{sequencer::ProposalSequencer, tracked::TrackedTxMap, transaction::PoolTx};
+use self::{
+    sequencer::{Proposal, ProposalSequencer},
+    tracked::TrackedTxMap,
+    transaction::PoolTx,
+};
 use crate::EthTxPoolEventTracker;
 
 mod config;
@@ -60,15 +64,24 @@ mod tracked;
 mod transaction;
 
 #[derive(Clone, Debug)]
-pub struct EthTxPool<ST, SCT, SBT, CCT, CRT>
+pub struct ProposalWithSenderGas<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    pub proposed_execution_inputs: ProposedExecutionInputs<EthExecutionProtocol>,
+    pub sender_gas: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EthTxPool<ST, SCT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
-    tracked: TrackedTxMap<ST, SCT, SBT, CCT, CRT>,
+    tracked: TrackedTxMap<ST, SCT, ESRT, CCT, CRT>,
 
     last_commit: Option<ConsensusBlockHeader<ST, SCT, EthExecutionProtocol>>,
 
@@ -77,11 +90,11 @@ where
     execution_revision: MonadExecutionRevision,
 }
 
-impl<ST, SCT, SBT, CCT, CRT> EthTxPool<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, ESRT, CCT, CRT> EthTxPool<ST, SCT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
@@ -123,10 +136,13 @@ where
         &mut self,
         event_tracker: &mut EthTxPoolEventTracker<'_>,
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
-        state_backend: &SBT,
+        state_read: &mut ESRT,
         chain_config: &CCT,
-        txs: Vec<(Recovered<TxEnvelope>, PoolTxKind)>,
-        mut on_insert: impl FnMut(&PoolTx),
+        txs: Vec<(
+            Recovered<TxEnvelope>,
+            PoolTxKind<CertificateSignaturePubKey<ST>>,
+        )>,
+        mut on_insert: impl FnMut(&PoolTx<CertificateSignaturePubKey<ST>>),
     ) {
         let Some(last_commit) = self.last_commit.as_ref() else {
             event_tracker.drop_all(
@@ -166,7 +182,7 @@ where
 
         let account_balances = match block_policy.compute_account_base_balances(
             block_seq_num,
-            state_backend,
+            state_read,
             chain_config,
             None,
             account_balance_addresses.iter(),
@@ -179,7 +195,9 @@ where
                 );
                 event_tracker.drop_all(
                     txs.into_iter().map(PoolTx::into_raw),
-                    EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
+                    EthTxPoolDropReason::Internal(
+                        EthTxPoolInternalDropReason::ExecutionStateReadError,
+                    ),
                 );
                 return;
             }
@@ -209,7 +227,7 @@ where
 
         let mut account_nonces = match block_policy.get_account_base_nonces(
             block_seq_num,
-            state_backend,
+            state_read,
             &vec![],
             account_nonce_addresses.iter(),
         ) {
@@ -221,7 +239,9 @@ where
                 );
                 event_tracker.drop_all(
                     txs.into_values().flatten().map(PoolTx::into_raw),
-                    EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
+                    EthTxPoolDropReason::Internal(
+                        EthTxPoolInternalDropReason::ExecutionStateReadError,
+                    ),
                 );
                 return;
             }
@@ -231,7 +251,9 @@ where
             let Some(account_nonce) = account_nonces.remove(&address) else {
                 event_tracker.drop_all(
                     txs.into_iter().map(PoolTx::into_raw),
-                    EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
+                    EthTxPoolDropReason::Internal(
+                        EthTxPoolInternalDropReason::ExecutionStateReadError,
+                    ),
                 );
                 continue;
             };
@@ -266,9 +288,9 @@ where
         extending_blocks: Vec<EthValidatedBlock<ST, SCT>>,
 
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
-        state_backend: &SBT,
+        state_read: &mut ESRT,
         chain_config: &CCT,
-    ) -> Result<ProposedExecutionInputs<EthExecutionProtocol>, BlockPolicyError> {
+    ) -> Result<ProposalWithSenderGas<ST>, BlockPolicyError> {
         info!(
             ?proposed_seq_num,
             ?tx_limit,
@@ -313,11 +335,12 @@ where
         let self_eth_address = node_id.pubkey().get_eth_address();
         let system_transactions = self.get_system_transactions(
             epoch,
+            round,
             proposed_seq_num,
             self_eth_address,
             &extending_blocks.iter().collect(),
             block_policy,
-            state_backend,
+            state_read,
             chain_config,
         )?;
         let system_txs_size: u64 = system_transactions
@@ -325,7 +348,7 @@ where
             .map(|tx| tx.length() as u64)
             .sum();
 
-        let user_transactions = self.sequence_user_transactions(
+        let user_proposal = self.sequence_user_transactions(
             event_tracker,
             proposed_seq_num,
             base_fee,
@@ -334,9 +357,15 @@ where
             proposal_byte_limit - system_txs_size,
             extending_blocks.iter().collect(),
             block_policy,
-            state_backend,
+            state_read,
             chain_config,
         )?;
+        let Proposal {
+            sender_gas,
+            txs: user_transactions,
+            total_gas: _,
+            total_size: _,
+        } = user_proposal;
 
         let body = EthBlockBody {
             transactions: system_transactions
@@ -390,7 +419,10 @@ where
 
         self.update_aggregate_metrics(event_tracker);
 
-        Ok(ProposedExecutionInputs { header, body })
+        Ok(ProposalWithSenderGas {
+            proposed_execution_inputs: ProposedExecutionInputs { header, body },
+            sender_gas,
+        })
     }
 
     pub fn enter_round(
@@ -535,19 +567,20 @@ where
     fn get_system_transactions(
         &self,
         proposed_epoch: Epoch,
+        proposed_round: Round,
         proposed_seq_num: SeqNum,
         block_author: Address,
         extending_blocks: &Vec<&EthValidatedBlock<ST, SCT>>,
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
-        state_backend: &SBT,
+        state_read: &mut ESRT,
         chain_config: &impl ChainConfig<CRT>,
-    ) -> Result<Vec<Recovered<TxEnvelope>>, StateBackendError> {
+    ) -> Result<Vec<Recovered<TxEnvelope>>, ExecutionStateReadError> {
         // TODO this should be inside SystemTransactionGenerator to prevent
         // exposing SYSTEM_SENDER_ETH_ADDRESS outside the crate
         let next_system_txn_nonce = *block_policy
             .get_account_base_nonces(
                 proposed_seq_num,
-                state_backend,
+                state_read,
                 extending_blocks,
                 [SYSTEM_SENDER_ETH_ADDRESS].iter(),
             )?
@@ -566,6 +599,7 @@ where
         let sys_txns = SystemTransactionGenerator::generate_system_transactions(
             proposed_seq_num,
             proposed_epoch,
+            proposed_round,
             parent_block_epoch,
             block_author,
             next_system_txn_nonce,
@@ -584,7 +618,7 @@ where
             .collect_vec())
     }
 
-    pub fn sequence_user_transactions(
+    fn sequence_user_transactions(
         &mut self,
         event_tracker: &mut EthTxPoolEventTracker<'_>,
         proposed_seq_num: SeqNum,
@@ -594,16 +628,16 @@ where
         proposal_byte_limit: u64,
         extending_blocks: Vec<&EthValidatedBlock<ST, SCT>>,
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
-        state_backend: &SBT,
+        state_read: &mut ESRT,
         chain_config: &CCT,
-    ) -> Result<Vec<Recovered<TxEnvelope>>, BlockPolicyError> {
+    ) -> Result<Proposal<ST>, BlockPolicyError> {
         let _timer = DropTimer::start(Duration::ZERO, |elapsed| {
             debug!(?elapsed, "txpool create_proposal");
         });
 
         let Some(last_commit) = self.last_commit.as_ref() else {
             error!("txpool create_proposal called before last committed block set");
-            return Ok(Vec::default());
+            return Ok(Proposal::default());
         };
 
         let last_commit_seq_num = last_commit.seq_num;
@@ -619,12 +653,12 @@ where
                 txpool_last_commit = last_commit_seq_num.0,
                 "txpool last commit update does not match block policy last commit"
             );
-            return Ok(Vec::default());
+            return Ok(Proposal::default());
         }
 
         if tx_limit == 0 {
             warn!("txpool create_proposal called with zero tx_limit");
-            return Ok(Vec::default());
+            return Ok(Proposal::default());
         }
 
         let sequencer =
@@ -632,10 +666,10 @@ where
         let sequencer_len = sequencer.len();
 
         if sequencer.is_empty() {
-            return Ok(Vec::default());
+            return Ok(Proposal::default());
         }
 
-        let (account_balances, state_backend_lookups) = {
+        let (account_balances, state_read_lookups) = {
             let _timer = DropTimer::start(Duration::ZERO, |elapsed| {
                 debug!(
                     ?elapsed,
@@ -643,17 +677,17 @@ where
                 );
             });
 
-            let total_db_lookups_before = state_backend.total_db_lookups();
+            let total_db_lookups_before = state_read.total_db_lookups();
 
             (
                 block_policy.compute_account_base_balances(
                     proposed_seq_num,
-                    state_backend,
+                    state_read,
                     chain_config,
                     Some(&extending_blocks),
                     sequencer.addresses(),
                 )?,
-                state_backend.total_db_lookups() - total_db_lookups_before,
+                state_read.total_db_lookups() - total_db_lookups_before,
             )
         };
 
@@ -662,7 +696,7 @@ where
             num_txs = self.tracked.num_txs(),
             sequencer_len,
             account_balances = account_balances.len(),
-            ?state_backend_lookups,
+            ?state_read_lookups,
             "txpool sequencing transactions"
         );
 
@@ -687,7 +721,7 @@ where
         event_tracker.record_create_proposal(
             self.tracked.num_addresses(),
             sequencer_len,
-            state_backend_lookups,
+            state_read_lookups,
             proposal_num_txs,
         );
 
@@ -698,15 +732,15 @@ where
             "created proposal"
         );
 
-        Ok(proposal.txs)
+        Ok(proposal)
     }
 }
 
-impl<ST, SCT, SBT> EthTxPool<ST, SCT, SBT, MockChainConfig, MockChainRevision>
+impl<ST, SCT, ESRT> EthTxPool<ST, SCT, ESRT, MockChainConfig, MockChainRevision>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 {
     pub fn default_testing() -> Self {

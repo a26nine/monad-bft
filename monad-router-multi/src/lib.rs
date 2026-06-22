@@ -34,6 +34,7 @@ use monad_node_config::{FullNodeConfig, FullNodeIdentityConfig};
 use monad_peer_discovery::{
     driver::PeerDiscoveryDriver, PeerDiscoveryAlgo, PeerDiscoveryAlgoBuilder,
 };
+use monad_peer_score::IdentityScore;
 use monad_raptorcast::{
     auth::AuthenticationProtocol,
     config::{
@@ -49,19 +50,21 @@ use monad_raptorcast::{
     RaptorCast, RaptorCastEvent,
 };
 use monad_types::{Epoch, NodeId};
+use monad_validator::proposer_schedule::BoxedProposerSchedule;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub use tracing::{debug, error, info, warn, Level};
 
 //==============================================================================
-pub struct MultiRouter<ST, M, OM, SE, PD, AP>
+pub struct MultiRouter<ST, M, OM, SE, PD, AP, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
     AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
-    rc_primary: RaptorCast<ST, M, OM, SE, PD, AP>,
+    rc_primary: RaptorCast<ST, M, OM, SE, PD, AP, DS>,
     rc_secondary: Option<RaptorCastSecondary<ST, M, OM, SE, PD>>,
 
     // raptorcast config is stored for future role change
@@ -75,14 +78,16 @@ where
     phantom: PhantomData<(OM, SE)>,
 }
 
-impl<ST, M, OM, SE, PD, AP> MultiRouter<ST, M, OM, SE, PD, AP>
+impl<ST, M, OM, SE, PD, AP, DS> MultiRouter<ST, M, OM, SE, PD, AP, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
     AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<B>(
         self_node_id: NodeId<CertificateSignaturePubKey<ST>>,
         cfg: RaptorCastConfig<ST>,
@@ -91,6 +96,9 @@ where
         current_epoch: Epoch,
         epoch_validators: BTreeMap<Epoch, BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
         auth_protocol: AP,
+        direct_udp_auth_protocol: Option<AP>,
+        direct_udp_peer_score: DS,
+        proposer_schedule: BoxedProposerSchedule<CertificateSignaturePubKey<ST>>,
     ) -> Self
     where
         B: PeerDiscoveryAlgoBuilder<PeerDiscoveryAlgoType = PD>,
@@ -103,11 +111,21 @@ where
         assert!(dp.block_until_ready(Duration::from_secs(1)));
 
         let tcp_socket = dp.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
-        let authenticated_socket = dp.udp_sockets.take(UdpSocketId::AuthenticatedRaptorcast);
-        let non_authenticated_socket = dp
+        let authenticated_socket = dp
             .udp_sockets
-            .take(UdpSocketId::Raptorcast)
-            .expect("raptorcast socket");
+            .take(UdpSocketId::AuthenticatedRaptorcast)
+            .expect("authenticated raptorcast socket");
+        let direct_udp = match (
+            dp.udp_sockets.take(UdpSocketId::DirectUdp),
+            direct_udp_auth_protocol,
+        ) {
+            (Some(socket), Some(protocol)) => Some((socket, protocol, direct_udp_peer_score)),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                panic!("direct udp socket and auth protocol must be set or unset together");
+            }
+        };
+        let non_authenticated_socket = dp.udp_sockets.take(UdpSocketId::Raptorcast);
         let control = dp.control;
 
         // Create channels between primary and secondary raptorcast instances.
@@ -145,19 +163,19 @@ where
             recv_group_messages,
             send_group_infos,
             send_outbound_to_primary,
-            current_epoch,
         );
 
         let mut rc_primary = RaptorCast::new(
             cfg.clone(),
             secondary_mode,
             tcp_socket,
-            authenticated_socket,
+            (authenticated_socket, auth_protocol),
+            direct_udp,
             non_authenticated_socket,
             control,
             shared_pdd.clone(),
             current_epoch,
-            auth_protocol,
+            proposer_schedule,
         );
         rc_primary.bind_channel_to_secondary_raptorcast(
             secondary_mode,
@@ -204,7 +222,6 @@ where
             recv_group_messages,
             send_group_infos,
             send_outbound_to_primary,
-            current_epoch,
         );
         self.rc_secondary = rc_secondary;
     }
@@ -218,7 +235,6 @@ where
         channel_to_primary_outbound: UnboundedSender<
             SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
         >,
-        current_epoch: Epoch,
     ) -> Option<RaptorCastSecondary<ST, M, OM, SE, PD>> {
         let secondary_instance: RaptorCastConfigSecondary<CertificateSignaturePubKey<ST>> =
             match mode {
@@ -285,21 +301,21 @@ where
                 recv_group_messages,
                 send_group_infos,
                 channel_to_primary_outbound,
-                current_epoch,
             )),
         }
     }
 }
 
 //==============================================================================
-impl<ST, M, OM, SE, PD, AP> Executor for MultiRouter<ST, M, OM, SE, PD, AP>
+impl<ST, M, OM, SE, PD, AP, DS> Executor for MultiRouter<ST, M, OM, SE, PD, AP, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
     AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
-    RaptorCast<ST, M, OM, SE, PD, AP>: Unpin,
+    DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
+    RaptorCast<ST, M, OM, SE, PD, AP, DS>: Unpin,
 {
     type Command = RouterCommand<ST, OM>;
 
@@ -312,10 +328,12 @@ where
                 RouterCommand::PublishWithPriority { .. } => validator_cmds.push(cmd),
                 RouterCommand::AddEpochValidatorSet {
                     epoch,
+                    epoch_start,
                     validator_set,
                 } => {
                     let cmd_cpy = RouterCommand::AddEpochValidatorSet {
                         epoch,
+                        epoch_start,
                         validator_set: validator_set.clone(),
                     };
                     debug!(?validator_set, "Updating validator set in multi router");
@@ -454,7 +472,7 @@ where
 }
 
 //==============================================================================
-impl<ST, M, OM, E, PD, AP> Stream for MultiRouter<ST, M, OM, E, PD, AP>
+impl<ST, M, OM, E, PD, AP, DS> Stream for MultiRouter<ST, M, OM, E, PD, AP, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
@@ -462,7 +480,8 @@ where
     E: From<RaptorCastEvent<M::Event, ST>>,
     Self: Unpin,
     AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
-    RaptorCast<ST, M, OM, E, PD, AP>: Unpin,
+    DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
+    RaptorCast<ST, M, OM, E, PD, AP, DS>: Unpin,
     RaptorCastSecondary<ST, M, OM, E, PD>: Unpin,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
     PeerDiscoveryDriver<PD>: Unpin,

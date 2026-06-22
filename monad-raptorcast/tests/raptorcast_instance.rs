@@ -32,16 +32,19 @@ use monad_crypto::certificate_signature::{
 use monad_dataplane::udp::DEFAULT_SEGMENT_SIZE;
 use monad_executor::Executor;
 use monad_executor_glue::{Message, RouterCommand};
-use monad_peer_discovery::mock::NopDiscovery;
+use monad_peer_discovery::{mock::NopDiscovery, MonadNameRecord, NameRecord};
 use monad_raptorcast::{
     create_dataplane_for_tests, new_defaulted_raptorcast_for_tests,
-    packet::build_messages,
+    new_defaulted_raptorcast_for_tests_with_name_records,
+    packet::{build_messages, regular},
     raptorcast_secondary::{
         group_message::FullNodesGroupMessage, SecondaryOutboundMessage,
         SecondaryRaptorCastModeConfig,
     },
-    udp::{GroupId, MAX_REDUNDANCY},
-    util::{BuildTarget, Redundancy, SecondaryGroup, SecondaryGroupAssignment},
+    util::{
+        BuildTarget, PrimaryBroadcastGroup, Redundancy, SecondaryGroup, SecondaryGroupAssignment,
+        ValidatorGroupMap,
+    },
     DataplaneHandles, RaptorCast, RaptorCastEvent,
 };
 use monad_secp::{KeyPair, SecpSignature};
@@ -87,15 +90,16 @@ pub fn different_symbol_sizes() {
 
         let valset = BTreeMap::from([(rx_nodeid, Stake::ONE), (tx_nodeid, Stake::ONE)]);
         let validators = ValidatorSet::new_unchecked(valset);
+        let group_map: ValidatorGroupMap<_> = [(Epoch(0), validators)].into();
+        let group = PrimaryBroadcastGroup::of_epoch(Epoch(0), &tx_nodeid, &group_map).unwrap();
 
         let messages = build_messages::<SignatureType>(
             &tx_keypair,
             segment_size,
             message.clone(),
             Redundancy::from_u8(2),
-            GroupId::Primary(Epoch(0)), // epoch_no
-            0,                          // unix_ts_ms
-            BuildTarget::Raptorcast(&validators),
+            0, // unix_ts_ms
+            BuildTarget::raptorcast(group),
             &known_addresses,
         );
 
@@ -141,15 +145,16 @@ pub fn buffer_count_overflow() {
 
     let valset = BTreeMap::from([(rx_nodeid, Stake::ONE), (tx_nodeid, Stake::ONE)]);
     let validators = ValidatorSet::new_unchecked(valset);
+    let group_map: ValidatorGroupMap<_> = [(Epoch(0), validators)].into();
+    let group = PrimaryBroadcastGroup::of_epoch(Epoch(0), &tx_nodeid, &group_map).unwrap();
 
     let messages = build_messages::<SignatureType>(
         &tx_keypair,
         DEFAULT_SEGMENT_SIZE,
         message,
         Redundancy::from_u8(2),
-        GroupId::Primary(Epoch(0)), // epoch_no
-        0,                          // unix_ts_ms
-        BuildTarget::Raptorcast(&validators),
+        0, // unix_ts_ms
+        BuildTarget::raptorcast(group),
         &known_addresses,
     );
 
@@ -211,15 +216,16 @@ pub fn valid_rebroadcast() {
 
     let valset = BTreeMap::from([(rx_nodeid, Stake::ONE), (tx_nodeid, Stake::ONE)]);
     let validators = ValidatorSet::new_unchecked(valset);
+    let group_map: ValidatorGroupMap<_> = [(Epoch(0), validators)].into();
+    let group = PrimaryBroadcastGroup::of_epoch(Epoch(0), &tx_nodeid, &group_map).unwrap();
 
     let messages = build_messages::<SignatureType>(
         &tx_keypair,
         DEFAULT_SEGMENT_SIZE,
         message,
-        MAX_REDUNDANCY,             // redundancy,
-        GroupId::Primary(Epoch(0)), // epoch_no
-        0,                          // unix_ts_ms
-        BuildTarget::Raptorcast(&validators),
+        regular::MAX_REDUNDANCY, // redundancy,
+        0,                       // unix_ts_ms
+        BuildTarget::raptorcast(group),
         &known_addresses,
     );
 
@@ -295,15 +301,23 @@ pub fn set_up_test(
     let rx_nodeid = NodeId::new(rx_keypair.pubkey());
 
     let dataplane = create_dataplane_for_tests(false);
-    let rx_addr = SocketAddr::V4(dataplane.non_auth_addr);
+    let rx_addr_v4 = dataplane.non_auth_addr;
+    let rx_addr = SocketAddr::V4(rx_addr_v4);
 
-    let tx_addr = UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let tx_addr = socket_addr_v4(
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+    );
 
     let mut known_addresses: HashMap<NodeId<PubKeyType>, SocketAddr> =
-        HashMap::from([(tx_nodeid, tx_addr), (rx_nodeid, rx_addr)]);
+        HashMap::from([(tx_nodeid, SocketAddr::V4(tx_addr)), (rx_nodeid, rx_addr)]);
+    let mut name_records: HashMap<NodeId<PubKeyType>, MonadNameRecord<SignatureType>> =
+        HashMap::from([
+            (tx_nodeid, test_name_record(&tx_keypair, tx_addr)),
+            (rx_nodeid, test_name_record(&rx_keypair, rx_addr_v4)),
+        ]);
 
     let mut validator_set = vec![(tx_nodeid, Stake::ONE), (rx_nodeid, Stake::ONE)];
 
@@ -315,8 +329,13 @@ pub fn set_up_test(
             .unwrap()
         };
         let rebroadcast_nodeid = NodeId::new(rebroadcast_keypair.pubkey());
+        let rebroadcast_addr = socket_addr_v4(rebroadcast_addr);
 
-        known_addresses.insert(rebroadcast_nodeid, rebroadcast_addr);
+        known_addresses.insert(rebroadcast_nodeid, SocketAddr::V4(rebroadcast_addr));
+        name_records.insert(
+            rebroadcast_nodeid,
+            test_name_record(&rebroadcast_keypair, rebroadcast_addr),
+        );
 
         validator_set.push((rebroadcast_nodeid, Stake::ONE));
     }
@@ -343,15 +362,22 @@ pub fn set_up_test(
         ));
 
         rt.spawn(async move {
-            let mut service = new_defaulted_raptorcast_for_tests::<
+            let mut service = new_defaulted_raptorcast_for_tests_with_name_records::<
                 SignatureType,
                 MockMessage,
                 MockMessage,
                 <MockMessage as Message>::Event,
-            >(dataplane, peer_addresses, Arc::new(rx_keypair));
+            >(
+                dataplane,
+                peer_addresses,
+                name_records,
+                Arc::new(rx_keypair),
+                Epoch(0),
+            );
 
             service.exec(vec![RouterCommand::AddEpochValidatorSet {
                 epoch: Epoch(0),
+                epoch_start: monad_types::Round(0),
                 validator_set,
             }]);
 
@@ -367,6 +393,42 @@ pub fn set_up_test(
     std::thread::sleep(Duration::from_millis(100));
 
     (tx_nodeid, tx_keypair, rx_nodeid, known_addresses, rx_addr)
+}
+
+fn socket_addr_v4(addr: SocketAddr) -> SocketAddrV4 {
+    match addr {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => panic!("IPv6 addresses not supported"),
+    }
+}
+
+fn test_name_record(keypair: &KeyPair, addr: SocketAddrV4) -> MonadNameRecord<SignatureType> {
+    let name_record = NameRecord::new_with_ports(
+        *addr.ip(),
+        addr.port(),
+        Some(addr.port()),
+        addr.port(),
+        None,
+        1,
+    );
+    MonadNameRecord::new(name_record, keypair)
+}
+
+fn test_peer_maps<const N: usize>(
+    peers: [(NodeId<PubKeyType>, &KeyPair, SocketAddrV4); N],
+) -> (
+    HashMap<NodeId<PubKeyType>, SocketAddrV4>,
+    HashMap<NodeId<PubKeyType>, MonadNameRecord<SignatureType>>,
+) {
+    let mut known_addresses = HashMap::new();
+    let mut name_records = HashMap::new();
+
+    for (id, keypair, addr) in peers {
+        known_addresses.insert(id, addr);
+        name_records.insert(id, test_name_record(keypair, addr));
+    }
+
+    (known_addresses, name_records)
 }
 
 #[derive(Clone, Copy, RlpEncodable, RlpDecodable)]
@@ -448,19 +510,145 @@ type MockRaptorCast = RaptorCast<
     MockEvent<CertificateSignaturePubKey<SignatureType>>,
     NopDiscovery<SignatureType>,
     monad_raptorcast::auth::NoopAuthProtocol<CertificateSignaturePubKey<SignatureType>>,
+    monad_raptorcast::auth::NopScore<NodeId<CertificateSignaturePubKey<SignatureType>>>,
 >;
 
 fn setup_raptorcast_service(
     keypair: KeyPair,
     dataplane: DataplaneHandles,
     known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4>,
+    name_records: HashMap<NodeId<PubKeyType>, MonadNameRecord<SignatureType>>,
 ) -> MockRaptorCast {
-    new_defaulted_raptorcast_for_tests::<
+    new_defaulted_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
         <MockMessage as Message>::Event,
-    >(dataplane, known_addresses, Arc::new(keypair))
+    >(
+        dataplane,
+        known_addresses,
+        name_records,
+        Arc::new(keypair),
+        Epoch(0),
+    )
+}
+
+// a fullnode must be able to forward an incoming FullNodesGroup
+// invite (e.g. PrepareGroup) from a validator to the secondary RC
+// channel even on a freshly booted node, before consensus has caught
+// up, to allow the fullnode to join the group and start receiving
+// proposals.
+#[cfg(test)]
+#[tokio::test]
+async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
+    let epoch = Epoch(5); // non-zero, simulating boot from a real forkpoint
+
+    let validator_keypair = keypair(1);
+    let validator_nodeid = NodeId::new(validator_keypair.pubkey());
+    let fullnode_keypair = keypair(2);
+    let fullnode_nodeid = NodeId::new(fullnode_keypair.pubkey());
+
+    // Only the fullnode is a real RaptorCast instance; the validator side just
+    // constructs and sends a packet manually, so it needs no dataplane.
+    let fullnode_dp = create_dataplane_for_tests(false);
+    let fullnode_addr = fullnode_dp.non_auth_addr;
+
+    let known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4> =
+        [(fullnode_nodeid, fullnode_addr)].into_iter().collect();
+    let known_addresses_socketaddr: HashMap<NodeId<PubKeyType>, SocketAddr> = known_addresses
+        .iter()
+        .map(|(k, v)| (*k, SocketAddr::V4(*v)))
+        .collect();
+
+    let mut fullnode_rc = new_defaulted_raptorcast_for_tests::<
+        SignatureType,
+        MockMessage,
+        MockMessage,
+        MockEvent<PubKeyType>,
+    >(
+        fullnode_dp,
+        known_addresses.clone(),
+        Arc::new(fullnode_keypair),
+        epoch,
+    );
+
+    fullnode_rc.exec(vec![RouterCommand::AddEpochValidatorSet {
+        epoch,
+        epoch_start: monad_types::Round(0),
+        validator_set: vec![(validator_nodeid, Stake::ONE)],
+    }]);
+
+    // Bind channel_to_secondary so the test can observe the forwarded message.
+    let (channel_to_secondary_tx, mut channel_to_secondary_rx) =
+        unbounded_channel::<FullNodesGroupMessage<SignatureType>>();
+    let (_assignment_tx, assignment_rx) =
+        unbounded_channel::<SecondaryGroupAssignment<PubKeyType>>();
+    let (_outbound_tx, outbound_rx) = unbounded_channel::<SecondaryOutboundMessage<PubKeyType>>();
+    fullnode_rc.bind_channel_to_secondary_raptorcast(
+        SecondaryRaptorCastModeConfig::Client,
+        channel_to_secondary_tx,
+        assignment_rx,
+        outbound_rx,
+    );
+
+    // Construct the invite, mirroring what raptorcast_secondary::publisher
+    // emits when inviting a fullnode into a new group.
+    let prepare = monad_raptorcast::raptorcast_secondary::group_message::PrepareGroup::<PubKeyType> {
+        validator_id: validator_nodeid,
+        max_group_size: 10,
+        start_round: Round(1),
+        end_round: Round(10),
+    };
+    let group_msg = FullNodesGroupMessage::<SignatureType>::PrepareGroup(prepare);
+    let router_msg: monad_raptorcast::message::OutboundRouterMessage<MockMessage, SignatureType> =
+        monad_raptorcast::message::OutboundRouterMessage::FullNodesGroup(group_msg.clone());
+    let msg_bytes = router_msg
+        .try_serialize()
+        .expect("serialize FullNodesGroup");
+
+    // Build a unicast raptorcast packet signed by the validator, targeted at the
+    // fullnode.
+    let packets = build_messages::<SignatureType>(
+        &validator_keypair,
+        DEFAULT_SEGMENT_SIZE,
+        msg_bytes,
+        Redundancy::from_u8(2),
+        0,
+        BuildTarget::point_to_point(epoch, &fullnode_nodeid),
+        &known_addresses_socketaddr,
+    );
+
+    // Drain startup events from the fullnode before sending.
+    loop {
+        tokio::select! {
+            biased;
+            _ = fullnode_rc.next() => {}
+            _ = std::future::ready(()) => break,
+        }
+    }
+
+    let tx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for (target_addr, payload) in &packets {
+        for chunk in payload.chunks(usize::from(DEFAULT_SEGMENT_SIZE)) {
+            tx_socket.send_to(chunk, target_addr).unwrap();
+        }
+    }
+
+    // Drive the fullnode event loop until the channel receives the message or we time out.
+    let received = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            tokio::select! {
+                biased;
+                msg = channel_to_secondary_rx.recv() => return msg,
+                _ = fullnode_rc.next() => continue,
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for FullNodesGroup forward")
+    .expect("channel_to_secondary closed");
+
+    assert_eq!(received, group_msg);
 }
 
 #[cfg(test)]
@@ -498,29 +686,52 @@ async fn publish_to_full_nodes() {
     let full_node1_dp = create_dataplane_for_tests(false);
     let full_node2_dp = create_dataplane_for_tests(false);
 
-    let known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4> = [
-        (validator_nodeid, validator_dp.non_auth_addr),
-        (full_node1_id, full_node1_dp.non_auth_addr),
-        (full_node2_id, full_node2_dp.non_auth_addr),
-    ]
-    .into_iter()
-    .collect();
+    let (known_addresses, name_records) = test_peer_maps([
+        (
+            validator_nodeid,
+            &validator_keypair,
+            validator_dp.non_auth_addr,
+        ),
+        (
+            full_node1_id,
+            &full_node1_keypair,
+            full_node1_dp.non_auth_addr,
+        ),
+        (
+            full_node2_id,
+            &full_node2_keypair,
+            full_node2_dp.non_auth_addr,
+        ),
+    ]);
 
     // 3. Create services with known addresses
-    let mut validator_rc =
-        setup_raptorcast_service(validator_keypair, validator_dp, known_addresses.clone());
+    let mut validator_rc = setup_raptorcast_service(
+        validator_keypair,
+        validator_dp,
+        known_addresses.clone(),
+        name_records.clone(),
+    );
     validator_rc.set_dedicated_full_nodes(vec![full_node1_id, full_node2_id]);
 
-    let mut full_node1_rc =
-        setup_raptorcast_service(full_node1_keypair, full_node1_dp, known_addresses.clone());
+    let mut full_node1_rc = setup_raptorcast_service(
+        full_node1_keypair,
+        full_node1_dp,
+        known_addresses.clone(),
+        name_records.clone(),
+    );
 
-    let mut full_node2_rc =
-        setup_raptorcast_service(full_node2_keypair, full_node2_dp, known_addresses.clone());
+    let mut full_node2_rc = setup_raptorcast_service(
+        full_node2_keypair,
+        full_node2_dp,
+        known_addresses.clone(),
+        name_records,
+    );
 
     // 4. Set validator set for all nodes
     for service in [&mut validator_rc, &mut full_node1_rc, &mut full_node2_rc] {
         service.exec(vec![RouterCommand::AddEpochValidatorSet {
             epoch: Epoch(0),
+            epoch_start: monad_types::Round(0),
             validator_set: validator_set.clone(),
         }]);
     }
@@ -571,7 +782,8 @@ async fn delete_expired_groups() {
     let node_id = NodeId::new(node_keypair.pubkey());
 
     let dataplane = create_dataplane_for_tests(false);
-    let mut raptorcast = setup_raptorcast_service(node_keypair, dataplane, HashMap::new());
+    let mut raptorcast =
+        setup_raptorcast_service(node_keypair, dataplane, HashMap::new(), HashMap::new());
     raptorcast.exec(vec![RouterCommand::UpdateCurrentRound(Epoch(1), Round(1))]);
 
     // setup
@@ -632,35 +844,49 @@ async fn test_priority_messages() {
     let tx_dataplane = create_dataplane_for_tests(false);
     let rx_dataplane = create_dataplane_for_tests(false);
 
-    let known_addresses = HashMap::from([
-        (tx_nodeid, tx_dataplane.non_auth_addr),
-        (rx_nodeid, rx_dataplane.non_auth_addr),
+    let (known_addresses, name_records) = test_peer_maps([
+        (tx_nodeid, tx_key.as_ref(), tx_dataplane.non_auth_addr),
+        (rx_nodeid, rx_key.as_ref(), rx_dataplane.non_auth_addr),
     ]);
 
-    let mut tx_rc = new_defaulted_raptorcast_for_tests::<
+    let mut tx_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
         MockEvent<PubKeyType>,
-    >(tx_dataplane, known_addresses.clone(), tx_key.clone());
+    >(
+        tx_dataplane,
+        known_addresses.clone(),
+        name_records.clone(),
+        tx_key.clone(),
+        Epoch(0),
+    );
 
-    let mut rx_rc = new_defaulted_raptorcast_for_tests::<
+    let mut rx_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
         MockEvent<PubKeyType>,
-    >(rx_dataplane, known_addresses.clone(), rx_key.clone());
+    >(
+        rx_dataplane,
+        known_addresses.clone(),
+        name_records,
+        rx_key.clone(),
+        Epoch(0),
+    );
 
     let epoch = Epoch(0);
     let validator_set = vec![(tx_nodeid, Stake::ONE), (rx_nodeid, Stake::ONE)];
 
     tx_rc.exec(vec![RouterCommand::AddEpochValidatorSet {
         epoch,
+        epoch_start: monad_types::Round(0),
         validator_set: validator_set.clone(),
     }]);
 
     rx_rc.exec(vec![RouterCommand::AddEpochValidatorSet {
         epoch,
+        epoch_start: monad_types::Round(0),
         validator_set: validator_set.clone(),
     }]);
 
@@ -750,16 +976,25 @@ async fn test_raptorcast_forwarding_priority() {
     let validator2_dataplane = create_dataplane_for_tests(false);
     let validator_fullnode_dataplane = create_dataplane_for_tests(false);
 
-    let known_addresses = HashMap::from([
-        (validator1_nodeid, validator1_dataplane.non_auth_addr),
-        (validator2_nodeid, validator2_dataplane.non_auth_addr),
+    let (known_addresses, name_records) = test_peer_maps([
+        (
+            validator1_nodeid,
+            validator1_key.as_ref(),
+            validator1_dataplane.non_auth_addr,
+        ),
+        (
+            validator2_nodeid,
+            validator2_key.as_ref(),
+            validator2_dataplane.non_auth_addr,
+        ),
         (
             validator_fullnode_nodeid,
+            validator_fullnode_key.as_ref(),
             validator_fullnode_dataplane.non_auth_addr,
         ),
     ]);
 
-    let mut validator1_rc = new_defaulted_raptorcast_for_tests::<
+    let mut validator1_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -767,10 +1002,12 @@ async fn test_raptorcast_forwarding_priority() {
     >(
         validator1_dataplane,
         known_addresses.clone(),
+        name_records.clone(),
         validator1_key.clone(),
+        Epoch(0),
     );
 
-    let mut validator2_rc = new_defaulted_raptorcast_for_tests::<
+    let mut validator2_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -778,10 +1015,12 @@ async fn test_raptorcast_forwarding_priority() {
     >(
         validator2_dataplane,
         known_addresses.clone(),
+        name_records.clone(),
         validator2_key.clone(),
+        Epoch(0),
     );
 
-    let mut validator_fullnode_rc = new_defaulted_raptorcast_for_tests::<
+    let mut validator_fullnode_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -789,7 +1028,9 @@ async fn test_raptorcast_forwarding_priority() {
     >(
         validator_fullnode_dataplane,
         known_addresses.clone(),
+        name_records,
         validator_fullnode_key.clone(),
+        Epoch(0),
     );
 
     let epoch = Epoch(0);
@@ -801,16 +1042,19 @@ async fn test_raptorcast_forwarding_priority() {
 
     validator1_rc.exec(vec![RouterCommand::AddEpochValidatorSet {
         epoch,
+        epoch_start: monad_types::Round(0),
         validator_set: validator_set.clone(),
     }]);
 
     validator2_rc.exec(vec![RouterCommand::AddEpochValidatorSet {
         epoch,
+        epoch_start: monad_types::Round(0),
         validator_set: validator_set.clone(),
     }]);
 
     validator_fullnode_rc.exec(vec![RouterCommand::AddEpochValidatorSet {
         epoch,
+        epoch_start: monad_types::Round(0),
         validator_set: validator_set.clone(),
     }]);
 

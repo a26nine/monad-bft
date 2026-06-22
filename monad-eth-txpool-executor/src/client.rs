@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{future::Future, pin::Pin, task::Poll};
+use std::{future::Future, pin::Pin, sync::Arc, task::Poll};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -24,16 +24,19 @@ use monad_crypto::certificate_signature::{
 };
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_types::EthExecutionProtocol;
+use monad_execution_state_read::ExecutionStateRead;
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
-use monad_executor_glue::{MonadEvent, TxPoolCommand};
+use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
 use monad_fair_queue::{FairQueue, FairQueueBuilder};
-use monad_peer_score::{ema::ScoreReader, StdClock};
+use monad_peer_score::{
+    ema::{ScoreProvider, ScoreReader},
+    StdClock,
+};
 use monad_secp::ExtractEthAddress;
-use monad_state_backend::StateBackend;
 use monad_types::NodeId;
 use monad_validator::signature_collection::SignatureCollection;
 
-use crate::forward::INGRESS_CHUNK_MAX_SIZE;
+use crate::{forward::INGRESS_CHUNK_MAX_SIZE, TxPoolExecutorCommand, TxPoolExecutorEvent};
 
 pub struct ForwardedTxs<SCT>
 where
@@ -91,6 +94,16 @@ monad_executor::metric_consts! {
     }
 }
 
+fn init_forwarded_ingress_metrics() -> ExecutorMetrics {
+    ExecutorMetrics::with_metric_defs(&[
+        COUNTER_TXPOOL_FORWARDED_INGRESS_ENQUEUED_TXS,
+        COUNTER_TXPOOL_FORWARDED_INGRESS_DROPPED_TXS,
+        COUNTER_TXPOOL_FORWARDED_INGRESS_DROP_EVENTS,
+        COUNTER_TXPOOL_FORWARDED_INGRESS_SENT_BATCHES,
+        COUNTER_TXPOOL_FORWARDED_INGRESS_SENT_TXS,
+    ])
+}
+
 type ForwardedPermitFuture<SCT> = Pin<
     Box<
         dyn Future<
@@ -121,45 +134,45 @@ where
     }
 }
 
-pub struct EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>
+pub struct EthTxPoolExecutorClient<ST, SCT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
     handle: tokio::task::JoinHandle<()>,
-    metrics: ExecutorMetrics,
-    update_metrics: Box<dyn Fn(&mut ExecutorMetrics)>,
+    metrics: Arc<ExecutorMetrics>,
+    forwarded_ingress_metrics: ExecutorMetrics,
 
     command_tx: tokio::sync::mpsc::Sender<
         Vec<
-            TxPoolCommand<
+            TxPoolExecutorCommand<
                 ST,
                 SCT,
                 EthExecutionProtocol,
                 EthBlockPolicy<ST, SCT, CCT, CRT>,
-                SBT,
+                ESRT,
                 CCT,
                 CRT,
             >,
         >,
     >,
     forwarded_tx: tokio::sync::mpsc::Sender<Vec<ForwardedTxs<SCT>>>,
-    forwarded_queue:
-        FairQueue<ScoreReader<NodeId<CertificateSignaturePubKey<ST>>, StdClock>, Bytes>,
+    forwarded_queue: FairQueue<ScoreReader<NodeId<SCT::NodeIdPubKey>, StdClock>, Bytes>,
     forwarded_pending_send: Option<PendingForwardedSend<SCT>>,
-    event_rx: tokio::sync::mpsc::Receiver<MonadEvent<ST, SCT, EthExecutionProtocol>>,
+    score_provider: ScoreProvider<NodeId<SCT::NodeIdPubKey>, StdClock>,
+    event_rx: tokio::sync::mpsc::Receiver<TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>>,
 }
 
-impl<ST, SCT, SBT, CCT, CRT> EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, ESRT, CCT, CRT> EthTxPoolExecutorClient<ST, SCT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -167,24 +180,25 @@ where
         updater: impl FnOnce(
                 tokio::sync::mpsc::Receiver<
                     Vec<
-                        TxPoolCommand<
+                        TxPoolExecutorCommand<
                             ST,
                             SCT,
                             EthExecutionProtocol,
                             EthBlockPolicy<ST, SCT, CCT, CRT>,
-                            SBT,
+                            ESRT,
                             CCT,
                             CRT,
                         >,
                     >,
                 >,
                 tokio::sync::mpsc::Receiver<Vec<ForwardedTxs<SCT>>>,
-                tokio::sync::mpsc::Sender<MonadEvent<ST, SCT, EthExecutionProtocol>>,
+                tokio::sync::mpsc::Sender<TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>>,
             ) -> F
             + Send
             + 'static,
-        update_metrics: Box<dyn Fn(&mut ExecutorMetrics) + Send + 'static>,
-        score_reader: ScoreReader<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
+        metrics: Arc<ExecutorMetrics>,
+        score_provider: ScoreProvider<NodeId<SCT::NodeIdPubKey>, StdClock>,
+        score_reader: ScoreReader<NodeId<SCT::NodeIdPubKey>, StdClock>,
         forwarded_queue_config: ForwardedIngressFairQueueConfig,
     ) -> Self
     where
@@ -192,7 +206,8 @@ where
     {
         Self::new_with_buffer_sizes(
             updater,
-            update_metrics,
+            metrics,
+            score_provider,
             score_reader,
             DEFAULT_COMMAND_BUFFER_SIZE,
             DEFAULT_FORWARDED_BUFFER_SIZE,
@@ -205,24 +220,25 @@ where
         updater: impl FnOnce(
                 tokio::sync::mpsc::Receiver<
                     Vec<
-                        TxPoolCommand<
+                        TxPoolExecutorCommand<
                             ST,
                             SCT,
                             EthExecutionProtocol,
                             EthBlockPolicy<ST, SCT, CCT, CRT>,
-                            SBT,
+                            ESRT,
                             CCT,
                             CRT,
                         >,
                     >,
                 >,
                 tokio::sync::mpsc::Receiver<Vec<ForwardedTxs<SCT>>>,
-                tokio::sync::mpsc::Sender<MonadEvent<ST, SCT, EthExecutionProtocol>>,
+                tokio::sync::mpsc::Sender<TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>>,
             ) -> F
             + Send
             + 'static,
-        update_metrics: Box<dyn Fn(&mut ExecutorMetrics) + Send + 'static>,
-        score_reader: ScoreReader<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
+        metrics: Arc<ExecutorMetrics>,
+        score_provider: ScoreProvider<NodeId<SCT::NodeIdPubKey>, StdClock>,
+        score_reader: ScoreReader<NodeId<SCT::NodeIdPubKey>, StdClock>,
         command_buffer_size: usize,
         forwarded_buffer_size: usize,
         event_buffer_size: usize,
@@ -239,8 +255,8 @@ where
 
         Self {
             handle,
-            metrics: ExecutorMetrics::default(),
-            update_metrics,
+            metrics,
+            forwarded_ingress_metrics: init_forwarded_ingress_metrics(),
 
             command_tx,
             forwarded_tx,
@@ -252,6 +268,7 @@ where
                 .regular_bandwidth_pct(forwarded_queue_config.regular_bandwidth_pct)
                 .build(score_reader),
             forwarded_pending_send: None,
+            score_provider,
             event_rx,
         }
     }
@@ -285,13 +302,19 @@ where
             for (index, tx) in txs.into_iter().enumerate() {
                 match self.forwarded_queue.push(sender, tx) {
                     Ok(()) => {
-                        self.metrics[COUNTER_TXPOOL_FORWARDED_INGRESS_ENQUEUED_TXS] += 1;
+                        self.forwarded_ingress_metrics
+                            .gauge(COUNTER_TXPOOL_FORWARDED_INGRESS_ENQUEUED_TXS)
+                            .inc();
                     }
                     Err(err) => {
                         let dropped = (txs_len - index) as u64;
                         total_dropped += dropped;
-                        self.metrics[COUNTER_TXPOOL_FORWARDED_INGRESS_DROPPED_TXS] += dropped;
-                        self.metrics[COUNTER_TXPOOL_FORWARDED_INGRESS_DROP_EVENTS] += 1;
+                        self.forwarded_ingress_metrics
+                            .gauge(COUNTER_TXPOOL_FORWARDED_INGRESS_DROPPED_TXS)
+                            .add(dropped);
+                        self.forwarded_ingress_metrics
+                            .gauge(COUNTER_TXPOOL_FORWARDED_INGRESS_DROP_EVENTS)
+                            .inc();
                         tracing::debug!(
                             ?sender,
                             error = %err,
@@ -358,8 +381,12 @@ where
                     self.forwarded_pending_send = None;
                     return false;
                 }
-                self.metrics[COUNTER_TXPOOL_FORWARDED_INGRESS_SENT_BATCHES] += 1;
-                self.metrics[COUNTER_TXPOOL_FORWARDED_INGRESS_SENT_TXS] += batch.len() as u64;
+                self.forwarded_ingress_metrics
+                    .gauge(COUNTER_TXPOOL_FORWARDED_INGRESS_SENT_BATCHES)
+                    .inc();
+                self.forwarded_ingress_metrics
+                    .gauge(COUNTER_TXPOOL_FORWARDED_INGRESS_SENT_TXS)
+                    .add(batch.len() as u64);
                 tracing::debug!(
                     batch_items = batch.len(),
                     "txpool forwarded_ingress: channel slot acquired, sending batch"
@@ -393,14 +420,58 @@ where
             cx.waker().wake_by_ref();
         }
     }
+
+    fn process_event(
+        &mut self,
+        event: TxPoolExecutorEvent<ST, SCT, EthExecutionProtocol>,
+    ) -> Option<MempoolEvent<ST, SCT, EthExecutionProtocol>> {
+        match event {
+            TxPoolExecutorEvent::Proposal {
+                epoch,
+                round,
+                seq_num,
+                high_qc,
+                timestamp_ns,
+                round_signature,
+                base_fee,
+                base_fee_trend,
+                base_fee_moment,
+                delayed_execution_results,
+                proposed_execution_inputs,
+                last_round_tc,
+                fresh_proposal_certificate,
+            } => Some(MempoolEvent::Proposal {
+                epoch,
+                round,
+                seq_num,
+                high_qc,
+                timestamp_ns,
+                round_signature,
+                base_fee,
+                base_fee_trend,
+                base_fee_moment,
+                delayed_execution_results,
+                proposed_execution_inputs,
+                last_round_tc,
+                fresh_proposal_certificate,
+            }),
+            TxPoolExecutorEvent::Contribution { sender_gas } => {
+                for (sender, gas) in sender_gas {
+                    self.score_provider.record_contribution(sender, gas);
+                }
+                None
+            }
+            TxPoolExecutorEvent::ForwardTxs(txs) => Some(MempoolEvent::ForwardTxs(txs)),
+        }
+    }
 }
 
-impl<ST, SCT, SBT, CCT, CRT> Executor for EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, ESRT, CCT, CRT> Executor for EthTxPoolExecutorClient<ST, SCT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -409,7 +480,7 @@ where
         SCT,
         EthExecutionProtocol,
         EthBlockPolicy<ST, SCT, CCT, CRT>,
-        SBT,
+        ESRT,
         CCT,
         CRT,
     >;
@@ -417,13 +488,74 @@ where
     fn exec(&mut self, commands: Vec<Self::Command>) {
         self.verify_handle_liveness();
 
-        let (commands, forwarded): (Vec<Self::Command>, Vec<ForwardedTxs<SCT>>) =
-            commands.into_iter().partition_map(|command| match command {
-                TxPoolCommand::InsertForwardedTxs { sender, txs } => {
-                    Either::Right(ForwardedTxs { sender, txs })
-                }
-                command => Either::Left(command),
-            });
+        let (commands, forwarded): (
+            Vec<
+                TxPoolExecutorCommand<
+                    ST,
+                    SCT,
+                    EthExecutionProtocol,
+                    EthBlockPolicy<ST, SCT, CCT, CRT>,
+                    ESRT,
+                    CCT,
+                    CRT,
+                >,
+            >,
+            Vec<ForwardedTxs<SCT>>,
+        ) = commands.into_iter().partition_map(|command| match command {
+            TxPoolCommand::BlockCommit(block_commit) => {
+                Either::Left(TxPoolExecutorCommand::BlockCommit(block_commit))
+            }
+            TxPoolCommand::CreateProposal {
+                node_id,
+                epoch,
+                round,
+                seq_num,
+                high_qc,
+                round_signature,
+                last_round_tc,
+                fresh_proposal_certificate,
+                tx_limit,
+                proposal_gas_limit,
+                proposal_byte_limit,
+                beneficiary,
+                timestamp_ns,
+                extending_blocks,
+                delayed_execution_results,
+            } => Either::Left(TxPoolExecutorCommand::CreateProposal {
+                node_id,
+                epoch,
+                round,
+                seq_num,
+                high_qc,
+                round_signature,
+                last_round_tc,
+                fresh_proposal_certificate,
+                tx_limit,
+                proposal_gas_limit,
+                proposal_byte_limit,
+                beneficiary,
+                timestamp_ns,
+                extending_blocks,
+                delayed_execution_results,
+            }),
+            TxPoolCommand::InsertForwardedTxs { sender, txs } => {
+                Either::Right(ForwardedTxs { sender, txs })
+            }
+            TxPoolCommand::EnterRound {
+                epoch,
+                round,
+                upcoming_leader_rounds,
+            } => Either::Left(TxPoolExecutorCommand::EnterRound {
+                epoch,
+                round,
+                upcoming_leader_rounds,
+            }),
+            TxPoolCommand::Reset {
+                last_delay_committed_blocks,
+            } => Either::Left(TxPoolExecutorCommand::Reset {
+                last_delay_committed_blocks,
+            }),
+        });
 
         if !commands.is_empty() {
             self.command_tx
@@ -437,16 +569,19 @@ where
     }
 
     fn metrics(&self) -> ExecutorMetricsChain<'_> {
-        ExecutorMetricsChain::from(&self.metrics).push(self.forwarded_queue.metrics())
+        ExecutorMetricsChain::from(self.metrics.as_ref())
+            .push(&self.forwarded_ingress_metrics)
+            .push(self.forwarded_queue.metrics())
+            .push(self.score_provider.executor_metrics())
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT> Stream for EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, ESRT, CCT, CRT> Stream for EthTxPoolExecutorClient<ST, SCT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -460,9 +595,22 @@ where
 
         this.verify_handle_liveness();
 
-        (this.update_metrics)(&mut this.metrics);
+        loop {
+            let Poll::Ready(result) = this.event_rx.poll_recv(cx) else {
+                break;
+            };
+
+            let Some(event) = result else {
+                return Poll::Ready(None);
+            };
+
+            if let Some(event) = this.process_event(event) {
+                return Poll::Ready(Some(MonadEvent::MempoolEvent(event)));
+            }
+        }
+
         this.poll_forwarded_send(cx);
 
-        this.event_rx.poll_recv(cx)
+        Poll::Pending
     }
 }

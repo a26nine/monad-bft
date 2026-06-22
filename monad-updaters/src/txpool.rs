@@ -37,11 +37,13 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_block_policy::EthBlockPolicy;
-use monad_eth_txpool::{EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTxKind};
+use monad_eth_txpool::{
+    EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTxKind, TXPOOL_EXECUTOR_METRIC_DEFS,
+};
 use monad_eth_types::{EthExecutionProtocol, ExtractEthAddress};
+use monad_execution_state_read::ExecutionStateRead;
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
-use monad_state_backend::StateBackend;
 use monad_types::{ExecutionProtocol, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 
@@ -52,7 +54,7 @@ pub trait MockableTxPool:
             Self::SignatureCollection,
             Self::ExecutionProtocol,
             Self::BlockPolicy,
-            Self::StateBackend,
+            Self::ExecutionStateRead,
             Self::ChainConfig,
             Self::ChainRevision,
         >,
@@ -70,11 +72,11 @@ pub trait MockableTxPool:
         Self::Signature,
         Self::SignatureCollection,
         Self::ExecutionProtocol,
-        Self::StateBackend,
+        Self::ExecutionStateRead,
         Self::ChainConfig,
         Self::ChainRevision,
     >;
-    type StateBackend: StateBackend<Self::Signature, Self::SignatureCollection>;
+    type ExecutionStateRead: ExecutionStateRead<Self::Signature, Self::SignatureCollection>;
 
     type Event;
 
@@ -88,7 +90,7 @@ impl<T: MockableTxPool + ?Sized> MockableTxPool for Box<T> {
     type SignatureCollection = T::SignatureCollection;
     type ExecutionProtocol = T::ExecutionProtocol;
     type BlockPolicy = T::BlockPolicy;
-    type StateBackend = T::StateBackend;
+    type ExecutionStateRead = T::ExecutionStateRead;
     type ChainConfig = T::ChainConfig;
     type ChainRevision = T::ChainRevision;
 
@@ -108,17 +110,17 @@ pub struct ByzantineConfig {
     pub no_increment_seq_num: bool,
 }
 
-pub struct MockTxPoolExecutor<ST, SCT, EPT, BPT, SBT, CCT, CRT>
+pub struct MockTxPoolExecutor<ST, SCT, EPT, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
     // This field is only populated when the execution protocol is EthExecutionProtocol
-    eth: Option<(EthTxPool<ST, SCT, SBT, CCT, CRT>, BPT, SBT)>,
+    eth: Option<(EthTxPool<ST, SCT, ESRT, CCT, CRT>, BPT, ESRT)>,
     chain_config: CCT,
     byzantine_config: ByzantineConfig,
 
@@ -129,16 +131,18 @@ where
     executor_metrics: ExecutorMetrics,
 }
 
-impl<ST, SCT, BPT, SBT, CCT, CRT> Default
-    for MockTxPoolExecutor<ST, SCT, MockExecutionProtocol, BPT, SBT, CCT, CRT>
+impl<ST, SCT, BPT, ESRT, CCT, CRT> Default
+    for MockTxPoolExecutor<ST, SCT, MockExecutionProtocol, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT> + Default,
     CRT: ChainRevision,
 {
     fn default() -> Self {
+        let mut executor_metrics = ExecutorMetrics::with_metric_defs(TXPOOL_EXECUTOR_METRIC_DEFS);
+
         Self {
             eth: None,
             chain_config: CCT::default(),
@@ -147,41 +151,43 @@ where
             events: VecDeque::default(),
             waker: None,
 
-            metrics: EthTxPoolMetrics::default(),
-            executor_metrics: ExecutorMetrics::default(),
+            metrics: EthTxPoolMetrics::from_executor_metrics(&mut executor_metrics),
+            executor_metrics,
         }
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, ESRT, CCT, CRT>
     MockTxPoolExecutor<
         ST,
         SCT,
         EthExecutionProtocol,
         EthBlockPolicy<ST, SCT, CCT, CRT>,
-        SBT,
+        ESRT,
         MockChainConfig,
         MockChainRevision,
     >
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 {
-    pub fn new(block_policy: EthBlockPolicy<ST, SCT, CCT, CRT>, state_backend: SBT) -> Self {
+    pub fn new(block_policy: EthBlockPolicy<ST, SCT, CCT, CRT>, state_read: ESRT) -> Self {
+        let mut executor_metrics = ExecutorMetrics::with_metric_defs(TXPOOL_EXECUTOR_METRIC_DEFS);
+
         Self {
-            eth: Some((EthTxPool::default_testing(), block_policy, state_backend)),
+            eth: Some((EthTxPool::default_testing(), block_policy, state_read)),
             chain_config: MockChainConfig::DEFAULT,
             byzantine_config: ByzantineConfig::default(),
 
             events: VecDeque::default(),
             waker: None,
 
-            metrics: EthTxPoolMetrics::default(),
-            executor_metrics: ExecutorMetrics::default(),
+            metrics: EthTxPoolMetrics::from_executor_metrics(&mut executor_metrics),
+            executor_metrics,
         }
     }
 
@@ -196,12 +202,20 @@ where
     }
 }
 
-impl<ST, SCT, BPT, SBT>
-    MockTxPoolExecutor<ST, SCT, MockExecutionProtocol, BPT, SBT, MockChainConfig, MockChainRevision>
+impl<ST, SCT, BPT, ESRT>
+    MockTxPoolExecutor<
+        ST,
+        SCT,
+        MockExecutionProtocol,
+        BPT,
+        ESRT,
+        MockChainConfig,
+        MockChainRevision,
+    >
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
 {
     pub fn with_chain_params(mut self, chain_params: &'static ChainParams) -> Self {
         self.chain_config = MockChainConfig::new(chain_params);
@@ -209,24 +223,31 @@ where
     }
 }
 
-impl<ST, SCT, BPT, SBT> Executor
+impl<ST, SCT, BPT, ESRT> Executor
     for MockTxPoolExecutor<
         ST,
         SCT,
         MockExecutionProtocol,
         BPT,
-        SBT,
+        ESRT,
         MockChainConfig,
         MockChainRevision,
     >
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    BPT: BlockPolicy<ST, SCT, MockExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, MockExecutionProtocol, ESRT, MockChainConfig, MockChainRevision>,
+    ESRT: ExecutionStateRead<ST, SCT>,
 {
-    type Command =
-        TxPoolCommand<ST, SCT, MockExecutionProtocol, BPT, SBT, MockChainConfig, MockChainRevision>;
+    type Command = TxPoolCommand<
+        ST,
+        SCT,
+        MockExecutionProtocol,
+        BPT,
+        ESRT,
+        MockChainConfig,
+        MockChainRevision,
+    >;
 
     fn exec(&mut self, commands: Vec<Self::Command>) {
         for command in commands {
@@ -292,20 +313,20 @@ where
     }
 }
 
-impl<ST, SCT, SBT> Executor
+impl<ST, SCT, ESRT> Executor
     for MockTxPoolExecutor<
         ST,
         SCT,
         EthExecutionProtocol,
         EthBlockPolicy<ST, SCT, MockChainConfig, MockChainRevision>,
-        SBT,
+        ESRT,
         MockChainConfig,
         MockChainRevision,
     >
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 {
     type Command = TxPoolCommand<
@@ -313,13 +334,13 @@ where
         SCT,
         EthExecutionProtocol,
         EthBlockPolicy<ST, SCT, MockChainConfig, MockChainRevision>,
-        SBT,
+        ESRT,
         MockChainConfig,
         MockChainRevision,
     >;
 
     fn exec(&mut self, commands: Vec<Self::Command>) {
-        let (pool, block_policy, state_backend) = self.eth.as_mut().unwrap();
+        let (pool, block_policy, state_read) = self.eth.as_mut().unwrap();
 
         let mut events = BTreeMap::default();
         let mut event_tracker = EthTxPoolEventTracker::new(&self.metrics, &mut events);
@@ -362,10 +383,11 @@ where
                             round_signature.clone(),
                             extending_blocks,
                             block_policy,
-                            state_backend,
+                            state_read,
                             &self.chain_config,
                         )
-                        .expect("proposal succeeds");
+                        .expect("proposal succeeds")
+                        .proposed_execution_inputs;
 
                     let seq_num = if self.byzantine_config.no_increment_seq_num {
                         seq_num - SeqNum(1)
@@ -399,7 +421,7 @@ where
                             ST,
                             SCT,
                             EthExecutionProtocol,
-                            SBT,
+                            ESRT,
                             MockChainConfig,
                             MockChainRevision,
                         >::update_committed_block(
@@ -419,7 +441,7 @@ where
                         ST,
                         SCT,
                         EthExecutionProtocol,
-                        SBT,
+                        ESRT,
                         MockChainConfig,
                         MockChainRevision,
                     >::reset(
@@ -431,17 +453,20 @@ where
                         last_delay_committed_blocks,
                     );
                 }
-                TxPoolCommand::InsertForwardedTxs { sender: _, txs } => {
+                TxPoolCommand::InsertForwardedTxs { sender, txs } => {
                     pool.insert_txs(
                         &mut event_tracker,
                         block_policy,
-                        state_backend,
+                        state_read,
                         &self.chain_config,
                         txs.into_iter()
                             .filter_map(|raw_tx| {
                                 let tx = TxEnvelope::decode_2718_exact(raw_tx.as_ref()).ok()?;
                                 let signer = tx.recover_signer().ok()?;
-                                Some((Recovered::new_unchecked(tx, signer), PoolTxKind::Forwarded))
+                                Some((
+                                    Recovered::new_unchecked(tx, signer),
+                                    PoolTxKind::Forwarded { sender },
+                                ))
                             })
                             .collect(),
                         |_| {},
@@ -452,8 +477,6 @@ where
                 TxPoolCommand::EnterRound { .. } => {}
             }
         }
-
-        self.metrics.update(&mut self.executor_metrics);
     }
 
     fn metrics(&self) -> ExecutorMetricsChain<'_> {
@@ -461,14 +484,14 @@ where
     }
 }
 
-impl<ST, SCT, EPT, BPT, SBT, CCT, CRT> Stream
-    for MockTxPoolExecutor<ST, SCT, EPT, BPT, SBT, CCT, CRT>
+impl<ST, SCT, EPT, BPT, ESRT, CCT, CRT> Stream
+    for MockTxPoolExecutor<ST, SCT, EPT, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, EPT, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 
@@ -494,24 +517,24 @@ where
     }
 }
 
-impl<ST, SCT, BPT, SBT, CCT, CRT> MockableTxPool
-    for MockTxPoolExecutor<ST, SCT, MockExecutionProtocol, BPT, SBT, CCT, CRT>
+impl<ST, SCT, BPT, ESRT, CCT, CRT> MockableTxPool
+    for MockTxPoolExecutor<ST, SCT, MockExecutionProtocol, BPT, ESRT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    BPT: BlockPolicy<ST, SCT, MockExecutionProtocol, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    BPT: BlockPolicy<ST, SCT, MockExecutionProtocol, ESRT, CCT, CRT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 
-    Self: Executor<Command = TxPoolCommand<ST, SCT, MockExecutionProtocol, BPT, SBT, CCT, CRT>>
+    Self: Executor<Command = TxPoolCommand<ST, SCT, MockExecutionProtocol, BPT, ESRT, CCT, CRT>>
         + Unpin,
 {
     type Signature = ST;
     type SignatureCollection = SCT;
     type ExecutionProtocol = MockExecutionProtocol;
     type BlockPolicy = BPT;
-    type StateBackend = SBT;
+    type ExecutionStateRead = ESRT;
     type ChainConfig = CCT;
     type ChainRevision = CRT;
 
@@ -528,20 +551,20 @@ where
     }
 }
 
-impl<ST, SCT, SBT> MockableTxPool
+impl<ST, SCT, ESRT> MockableTxPool
     for MockTxPoolExecutor<
         ST,
         SCT,
         EthExecutionProtocol,
         EthBlockPolicy<ST, SCT, MockChainConfig, MockChainRevision>,
-        SBT,
+        ESRT,
         MockChainConfig,
         MockChainRevision,
     >
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    ESRT: ExecutionStateRead<ST, SCT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 
     Self: Executor<
@@ -550,7 +573,7 @@ where
                 SCT,
                 EthExecutionProtocol,
                 EthBlockPolicy<ST, SCT, MockChainConfig, MockChainRevision>,
-                SBT,
+                ESRT,
                 MockChainConfig,
                 MockChainRevision,
             >,
@@ -560,7 +583,7 @@ where
     type SignatureCollection = SCT;
     type ExecutionProtocol = EthExecutionProtocol;
     type BlockPolicy = EthBlockPolicy<ST, SCT, MockChainConfig, MockChainRevision>;
-    type StateBackend = SBT;
+    type ExecutionStateRead = ESRT;
     type ChainConfig = MockChainConfig;
     type ChainRevision = MockChainRevision;
 
@@ -571,7 +594,7 @@ where
     }
 
     fn send_transaction(&mut self, tx: Bytes) {
-        let (pool, block_policy, state_backend) = self.eth.as_mut().unwrap();
+        let (pool, block_policy, state_read) = self.eth.as_mut().unwrap();
 
         let Ok(tx) = TxEnvelope::decode_2718_exact(tx.as_ref()) else {
             panic!("MockableTxPool received invalid tx bytes!");
@@ -586,7 +609,7 @@ where
         pool.insert_txs(
             &mut EthTxPoolEventTracker::new(&self.metrics, &mut BTreeMap::default()),
             block_policy,
-            state_backend,
+            state_read,
             &MockChainConfig::DEFAULT,
             vec![(tx, PoolTxKind::owned_default())],
             |tx| {

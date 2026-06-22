@@ -13,11 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::BTreeMap;
+
 use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_eth_types::{serde::deserialize_eth_address_from_str, EthExecutionProtocol};
+use monad_peer_score::ema;
 use serde::Deserialize;
 
 pub use self::{
@@ -36,6 +39,9 @@ mod peers;
 pub mod fullnode_raptorcast;
 pub use fullnode_raptorcast::FullNodeRaptorCastConfig;
 
+pub mod raptorcast;
+pub use raptorcast::DeterministicProtocolRolloutStage;
+
 mod sync_peers;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -47,6 +53,9 @@ pub struct NodeConfig<ST: CertificateSignatureRecoverable> {
     /////////////////////////////////
     pub node_name: String,
     pub network_name: String,
+
+    #[serde(default)]
+    pub prometheus: Option<PrometheusConfig>,
 
     #[serde(deserialize_with = "deserialize_eth_address_from_str")]
     pub beneficiary: Address,
@@ -65,15 +74,29 @@ pub struct NodeConfig<ST: CertificateSignatureRecoverable> {
     pub statesync: StateSyncPeersConfig<CertificateSignaturePubKey<ST>>,
     pub network: NodeNetworkConfig,
 
+    #[serde(deserialize_with = "peers::deserialize_peer_discovery_config")]
     pub peer_discovery: PeerDiscoveryConfig<ST>,
+    #[serde(default)]
+    pub txpool_peer_score: ema::ScoreConfig,
 
     pub fullnode_raptorcast: FullNodeRaptorCastConfig<CertificateSignaturePubKey<ST>>,
+
+    #[serde(default)]
+    pub deterministic_raptorcast_rollout: DeterministicProtocolRolloutStage,
 
     // TODO split network-wide configuration into separate file
     ////////////////////////////////
     // NETWORK-WIDE CONFIGURATION //
     ////////////////////////////////
     pub chain_id: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PrometheusConfig {
+    pub bind_addr: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[cfg(feature = "crypto")]

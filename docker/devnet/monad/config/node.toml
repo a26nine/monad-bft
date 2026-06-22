@@ -48,6 +48,9 @@ min_num_peers = 0
 max_num_peers = 200
 ping_rate_limit_per_second = 100
 
+[txpool_peer_score]
+promotion_threshold = 20000.0
+
 [fullnode_dedicated]
 identities = []
 # [[fullnode_dedicated.identities]]
@@ -88,3 +91,8 @@ bind_address_port = 8000
 authenticated_bind_address_port = 8001
 max_rtt_ms = 300
 max_mbps = 1000
+
+[prometheus]
+bind_addr = ""
+
+[prometheus.labels]

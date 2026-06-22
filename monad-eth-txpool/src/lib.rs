@@ -15,9 +15,10 @@
 
 pub use self::{
     event_tracker::EthTxPoolEventTracker,
-    metrics::EthTxPoolMetrics,
+    metrics::{EthTxPoolMetrics, TXPOOL_EXECUTOR_METRIC_DEFS},
     pool::{
-        max_eip2718_encoded_length, EthTxPool, EthTxPoolConfig, PoolTxKind, TrackedTxLimitsConfig,
+        max_eip2718_encoded_length, EthTxPool, EthTxPoolConfig, PoolTxKind, ProposalWithSenderGas,
+        TrackedTxLimitsConfig,
     },
 };
 
